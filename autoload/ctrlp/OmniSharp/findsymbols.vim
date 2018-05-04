@@ -47,21 +47,20 @@ call add(g:ctrlp_ext_vars, {
 \ })
 
 
+function! ctrlp#OmniSharp#findsymbols#setsymbols(quickfixes) abort
+  let s:quickfixes = a:quickfixes
+  let s:symbols = []
+  for quickfix in s:quickfixes
+    call add(s:symbols, quickfix.text)
+  endfor
+endfunction
+
 " Provide a list of strings to search in
 "
 " Return: a Vim's List
 "
 function! ctrlp#OmniSharp#findsymbols#init() abort
-  if !OmniSharp#ServerIsRunning()
-    return
-  endif
-
-  let s:quickfixes = pyeval('findSymbols()')
-  let symbols = []
-  for quickfix in s:quickfixes
-    call add(symbols, quickfix.text)
-  endfor
-  return symbols
+  return s:symbols
 endfunction
 
 

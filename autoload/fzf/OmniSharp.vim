@@ -30,11 +30,8 @@ function! fzf#OmniSharp#findtypes() abort
   \ 'sink': function('s:location_sink')})
 endfunction
 
-function! fzf#OmniSharp#findsymbols() abort
-  if !OmniSharp#ServerIsRunning()
-    return
-  endif
-  let s:quickfixes = pyeval('findSymbols()')
+function! fzf#OmniSharp#findsymbols(quickfixes) abort
+  let s:quickfixes = a:quickfixes
   let symbols = []
   for quickfix in s:quickfixes
     call add(symbols, quickfix.text)
@@ -46,19 +43,32 @@ function! fzf#OmniSharp#findsymbols() abort
 endfunction
 
 function! s:action_sink(str) abort
-  let action = index(s:actions, a:str)
-  call pyeval(printf('runCodeAction(%s, %d)', string(s:mode), action))
+  if s:version ==# 'v1'
+    let action = index(s:actions, a:str)
+    let command = printf('runCodeAction(%s, %d)', string(s:mode), action)
+  else
+    let action = filter(copy(s:actions), {i,v -> get(v, 'Name') ==# a:str})[0]
+    let command = substitute(get(action, 'Identifier'), '''', '\\''', 'g')
+    let command = printf('runCodeAction(''%s'', ''%s'', ''v2'')', s:mode, command)
+  endif
+  if !pyeval(command)
+    echo 'No action taken'
+  endif
 endfunction
 
-function! fzf#OmniSharp#getcodeactions(mode) abort
-  let s:actions = pyeval(printf('getCodeActions(%s)', string(a:mode)))
+function! fzf#OmniSharp#getcodeactions(mode, actions) abort
+  " When using the roslyn server, use /v2/codeactions
+  let s:version = g:OmniSharp_server_type ==# 'roslyn' ? 'v2' : 'v1'
+  let s:actions = a:actions
   let s:mode = a:mode
-  if empty(s:actions)
-    echo 'No code actions found'
-    return
+  if s:version ==# 'v1'
+    let acts = s:actions
+  else
+    let acts = map(copy(s:actions), {i,v -> get(v, 'Name')})
   endif
+
   call fzf#run({
-  \ 'source': s:actions,
+  \ 'source': acts,
   \ 'down': '10%',
   \ 'sink': function('s:action_sink')})
 endfunction

@@ -1,5 +1,5 @@
-import vim, urllib2, urllib, urlparse, logging, json, os, os.path, cgi, types, threading
-import asyncrequest
+import json, logging, os.path, platform, re, urllib2, urlparse, vim, socket
+from contextlib import closing
 
 logger = logging.getLogger('omnisharp')
 logger.setLevel(logging.WARNING)
@@ -13,13 +13,45 @@ logger.addHandler(hdlr)
 formatter = logging.Formatter('%(asctime)s %(levelname)s %(message)s')
 hdlr.setFormatter(formatter)
 
+translate_unix_win = bool(int(vim.eval('g:OmniSharp_translate_cygwin_wsl')))
+is_msys = 'msys_nt' in platform.system().lower()
+is_cygwin = 'cygwin' in platform.system().lower()
+is_wsl = 'linux' in platform.system().lower() and 'microsoft' in platform.release().lower()
+
+# When working in Windows Subsystem for Linux (WSL) or Cygwin, vim uses
+# unix-style paths but OmniSharp (with a Windows binary) uses Windows
+# paths. This means that filenames returned FROM OmniSharp must be
+# translated from e.g. "C:\path\to\file" to "/mnt/c/path/to/file", and
+# filenames sent TO OmniSharp must be translated in the other direction.
+def formatPathForServer(filepath):
+    if translate_unix_win and (is_msys or is_cygwin or is_wsl):
+        if is_msys:
+            pattern = r'^/([a-zA-Z])/'
+        elif is_cygwin:
+            pattern = r'^/cygdrive/([a-zA-Z])/'
+        else:
+            pattern = r'^/mnt/([a-zA-Z])/'
+        return re.sub(pattern, r'\1:\\', filepath).replace('/', '\\')
+    return filepath
+def formatPathForClient(filepath):
+    if translate_unix_win and (is_msys or is_cygwin or is_wsl):
+        def path_replace(matchobj):
+            if is_msys:
+                prefix = '/{0}/'
+            elif is_cygwin:
+                prefix = '/cygdrive/{0}/'
+            else:
+                prefix = '/mnt/{0}/'
+            return prefix.format(matchobj.group(1).lower())
+        return re.sub(r'^([a-zA-Z]):\\', path_replace, filepath).replace('\\', '/')
+    return filepath
 
 def getResponse(endPoint, additional_parameters=None, timeout=None):
     parameters = {}
     parameters['line'] = vim.eval('line(".")')
     parameters['column'] = vim.eval('col(".")')
     parameters['buffer'] = '\r\n'.join(vim.eval("getline(1,'$')")[:])
-    parameters['filename'] = vim.current.buffer.name
+    parameters['filename'] = formatPathForServer(vim.current.buffer.name)
     if additional_parameters != None:
         parameters.update(additional_parameters)
 
@@ -67,43 +99,113 @@ def findImplementations():
     js = getResponse('/findimplementations', parameters)
     return get_quickfix_list(js, 'QuickFixes')
 
+def getCompletions(partialWord):
+    parameters = {}
+    parameters['column'] = vim.eval('col(".")')
+    parameters['buffer'] = '\r\n'.join(vim.eval("getline(1,'$')")[:])
+    parameters['wordToComplete'] = partialWord
+
+    parameters['WantDocumentationForEveryCompletionResult'] = \
+        bool(int(vim.eval('g:omnicomplete_fetch_full_documentation')))
+
+    want_snippet = \
+        bool(int(vim.eval('g:OmniSharp_want_snippet')))
+
+    parameters['WantSnippet'] = want_snippet
+    parameters['WantMethodHeader'] = want_snippet
+    parameters['WantReturnType'] = want_snippet
+
+    response = json.loads(getResponse('/autocomplete', parameters))
+
+    vim_completions = []
+    if response != None:
+        for completion in response:
+            vim_completions.append({
+                'snip': completion['Snippet'] or '',
+                'word': completion['MethodHeader'] or completion['CompletionText'],
+                'menu': completion['ReturnType'] or completion['DisplayText'],
+                'info': (completion['Description'] or '').replace('\r\n', '\n'),
+                'icase': 1,
+                'dup': 1
+            })
+    return vim_completions
+
 def gotoDefinition():
     js = getResponse('/gotodefinition');
-    if(js != ''):
+    if js != '':
         definition = json.loads(js)
         if(definition['FileName'] != None):
-            openFile(definition['FileName'].replace("'","''"), definition['Line'], definition['Column'])
+            filename = formatPathForClient(definition['FileName'].replace("'","''"))
+            openFile(filename, definition['Line'], definition['Column'])
         else:
-            print "Not found"
+            print("Not found")
 
 def openFile(filename, line, column):
     vim.command("call OmniSharp#JumpToLocation('%(filename)s', %(line)s, %(column)s)" % locals())
 
-def getCodeActions(mode):
-    parameters = codeActionParameters(mode)
-    js = getResponse('/getcodeactions', parameters)
+def getCodeActions(mode, version='v1'):
+    parameters = codeActionParameters(mode, version)
+    if version == 'v1':
+        endpoint = '/getcodeactions'
+    elif version == 'v2':
+        endpoint = '/v2/getcodeactions'
+    js = getResponse(endpoint, parameters)
     if js != '':
         actions = json.loads(js)['CodeActions']
         return actions
     return []
 
-def runCodeAction(mode, action):
-    parameters = codeActionParameters(mode)
-    parameters['codeaction'] = action
-    js = getResponse('/runcodeaction', parameters);
-    text = json.loads(js)['Text']
-    setBufferText(text)
-    return True
+def runCodeAction(mode, action, version='v1'):
+    def __applyChange(changeDefinition):
+        filename = formatPathForClient(changeDefinition['FileName'])
+        openFile(filename, 1, 1)
+        if __isBufferChange(changeDefinition):
+            setBufferText(changeDefinition['Buffer'])
+        elif __isNewFile(changeDefinition):
+            for change in changeDefinition['Changes']:
+                setBufferText(change['NewText'])
 
-def codeActionParameters(mode):
+    def __isBufferChange(changeDefinition):
+        return 'Buffer' in changeDefinition and changeDefinition['Buffer'] != None
+
+    def __isNewFile(changeDefinition):
+        return 'Changes' in changeDefinition and changeDefinition['Changes'] != None
+
+    parameters = codeActionParameters(mode, version)
+    if version == 'v1':
+        parameters['codeaction'] = action
+        res = getResponse('/runcodeaction', parameters)
+        js = json.loads(res)
+        if 'Text' in js:
+            setBufferText(js['Text'])
+            return True
+    elif version == 'v2':
+        parameters['identifier'] = action
+        res = getResponse('/v2/runcodeaction', parameters)
+        js = json.loads(res)
+        if 'Changes' in js:
+            vim.command("let cursor_position = getcurpos()")
+            for changeDefinition in js['Changes']:
+                __applyChange(changeDefinition)
+            vim.command("call setpos('.', cursor_position)")
+            return True
+    return False
+
+def codeActionParameters(mode, version='v1'):
     parameters = {}
     if mode == 'visual':
         start = vim.eval('getpos("\'<")')
         end = vim.eval('getpos("\'>")')
-        parameters['SelectionStartLine'] = start[1]
-        parameters['SelectionStartColumn'] = start[2]
-        parameters['SelectionEndLine'] = end[1]
-        parameters['SelectionEndColumn'] = end[2]
+        if version == 'v1':
+            parameters['SelectionStartLine'] = start[1]
+            parameters['SelectionStartColumn'] = start[2]
+            parameters['SelectionEndLine'] = end[1]
+            parameters['SelectionEndColumn'] = end[2]
+        elif version == 'v2':
+            parameters['Selection'] = {
+                'Start': { 'Line': start[1], 'Column': start[2] },
+                'End': { 'Line': end[1], 'Column': end[2] }
+            }
     return parameters
 
 def setBufferText(text):
@@ -159,9 +261,9 @@ def build():
 
     success = js["Success"]
     if success:
-        print "Build succeeded"
+        print("Build succeeded")
     else:
-        print "Build failed"
+        print("Build failed")
 
     return quickfixes_from_js(js, 'QuickFixes')
 
@@ -194,7 +296,7 @@ def addReference():
     js = getResponse("/addreference", parameters)
     if js != '':
         message = json.loads(js)['Message']
-        print message
+        print(message)
 
 def findSyntaxErrors():
     js = getResponse('/syntaxerrors')
@@ -208,8 +310,10 @@ def findTypes():
     js = getResponse('/findtypes')
     return get_quickfix_list(js, 'QuickFixes')
 
-def findSymbols():
-    js = getResponse('/findsymbols')
+def findSymbols(filter=''):
+    parameters = {}
+    parameters["filter"] = filter
+    js = getResponse('/findsymbols', parameters)
     return get_quickfix_list(js, 'QuickFixes')
 
 def get_quickfix_list(js, key):
@@ -232,18 +336,48 @@ def quickfixes_from_response(response):
         if 'Message' in quickfix:
             text = quickfix['Message']
 
+        filename = quickfix['FileName']
+        if filename == None:
+            filename = vim.current.buffer.name
+        else:
+            filename = formatPathForClient(filename)
+
         item = {
-            'filename': quickfix['FileName'],
+            'filename': filename,
             'text': text,
             'lnum': quickfix['Line'],
             'col': quickfix['Column'],
             'vcol': 0
         }
+        if 'LogLevel' in quickfix:
+            item['type'] = 'E' if quickfix['LogLevel'] == 'Error' else 'W'
+            if quickfix['LogLevel'] == 'Hidden':
+                item['subtype'] = 'Style'
+
         items.append(item)
 
     return items
 
 def lookupAllUserTypes():
+    js = getResponse('/findsymbols', {'filter': ''})
+    if js != '':
+        response = json.loads(js)
+        if response != None and response['QuickFixes'] != None:
+            slnTypes = []
+            slnInterfaces = []
+            slnAttributes = []
+            for symbol in response['QuickFixes']:
+                if symbol['Kind'] == 'Class':
+                    slnTypes.append(symbol['Text'])
+                    if symbol['Text'].endswith('Attribute'):
+                        slnAttributes.append(symbol['Text'][:-9])
+                elif symbol['Kind'] == 'Interface':
+                    slnInterfaces.append(symbol['Text'])
+            vim.command("let s:allUserTypes = '%s'" % ' '.join(slnTypes))
+            vim.command("let s:allUserInterfaces = '%s'" % ' '.join(slnInterfaces))
+            vim.command("let s:allUserAttributes = '%s'" % ' '.join(slnAttributes))
+
+def lookupAllUserTypesLegacy():
     js = getResponse('/lookupalltypes')
     if js != '':
         response = json.loads(js)
@@ -265,3 +399,8 @@ def get_navigate_response(js):
         return {'Line': response['Line'], 'Column': response['Column']}
     else:
         return {}
+
+def find_free_port():
+    with closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as s:
+        s.bind(('', 0))
+        return s.getsockname()[1]

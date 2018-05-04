@@ -47,6 +47,8 @@ call add(g:ctrlp_ext_vars, {
 
 
 function! ctrlp#OmniSharp#findcodeactions#setactions(mode, actions) abort
+  " When using the roslyn server, use /v2/codeactions
+  let s:version = g:OmniSharp_server_type ==# 'roslyn' ? 'v2' : 'v1'
   let s:actions = a:actions
   let s:mode = a:mode
 endfunction
@@ -55,10 +57,12 @@ endfunction
 "
 " Return: a Vim's List
 "
-"
-
 function! ctrlp#OmniSharp#findcodeactions#init() abort
-  return s:actions
+  if s:version ==# 'v1'
+    return s:actions
+  else
+    return map(copy(s:actions), {i,v -> get(v, 'Name')})
+  endif
 endfunction
 
 
@@ -71,8 +75,17 @@ endfunction
 "
 function! ctrlp#OmniSharp#findcodeactions#accept(mode, str) abort
   call ctrlp#exit()
-  let action = index(s:actions, a:str)
-  call pyeval(printf('runCodeAction(%s, %d)', string(s:mode), action))
+  if s:version ==# 'v1'
+    let action = index(s:actions, a:str)
+    let command = printf('runCodeAction(%s, %d)', string(s:mode), action)
+  else
+    let action = filter(copy(s:actions), {i,v -> get(v, 'Name') ==# a:str})[0]
+    let command = substitute(get(action, 'Identifier'), '''', '\\''', 'g')
+    let command = printf('runCodeAction(''%s'', ''%s'', ''v2'')', s:mode, command)
+  endif
+  if !pyeval(command)
+    echo 'No action taken'
+  endif
 endfunction
 
 " Give the extension an ID

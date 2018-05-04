@@ -7,9 +7,8 @@ if get(b:, 'OmniSharp_ftplugin_loaded', 0)
 endif
 let b:OmniSharp_ftplugin_loaded = 1
 
-"Set a default value for the server address
 if !exists('g:omnicomplete_fetch_full_documentation')
-    let g:omnicomplete_fetch_full_documentation = 0
+  let g:omnicomplete_fetch_full_documentation = 0
 endif
 
 augroup plugin-OmniSharp
@@ -21,7 +20,6 @@ augroup plugin-OmniSharp
   \|  endif
 
   autocmd CompleteDone <buffer> call OmniSharp#ExpandAutoCompleteSnippet()
-
 augroup END
 
 setlocal omnifunc=OmniSharp#Complete
@@ -40,7 +38,7 @@ command! -buffer -bar OmniSharpCodeFormat          call OmniSharp#CodeFormat()
 command! -buffer -bar OmniSharpDocumentation       call OmniSharp#TypeLookupWithDocumentation()
 command! -buffer -bar OmniSharpFindImplementations call OmniSharp#FindImplementations()
 command! -buffer -bar OmniSharpFindMembers         call OmniSharp#FindMembers()
-command! -buffer -bar OmniSharpFindSymbol          call OmniSharp#FindSymbol()
+command! -buffer -bar -nargs=? OmniSharpFindSymbol call OmniSharp#FindSymbol(<q-args>)
 command! -buffer -bar OmniSharpFindSyntaxErrors    call OmniSharp#FindSyntaxErrors()
 command! -buffer -bar OmniSharpFindType            call OmniSharp#FindType()
 command! -buffer -bar OmniSharpFindUsages          call OmniSharp#FindUsages()

@@ -1,22 +1,20 @@
-if !has('python')
-  echoerr 'Error: OmniSharp requires Vim compiled with +python'
-  finish
-endif
-
 if exists('g:OmniSharp_loaded')
   finish
 endif
 
 let g:OmniSharp_loaded = 1
 
-"Load python/OmniSharp.py
-let s:py_path = join([expand('<sfile>:p:h:h'), 'python'], '/')
-exec "python sys.path.append(r'" . s:py_path . "')"
-exec 'pyfile ' . fnameescape(s:py_path . '/Completion.py')
-exec 'pyfile ' . fnameescape(s:py_path . '/OmniSharp.py')
+if !has('python')
+  echoerr 'Error: OmniSharp requires Vim compiled with +python'
+  finish
+endif
 
+" Set default for translating cygwin/WSL unix paths to Windows paths
+let g:OmniSharp_translate_cygwin_wsl = get(g:, 'OmniSharp_translate_cygwin_wsl', 0)
 
-let g:OmniSharp_port = get(g:, 'OmniSharp_port', 2000)
+let g:OmniSharp_use_random_port = get(g:, 'OmniSharp_use_random_port', 0)
+let s:OmniSharp_default_port = g:OmniSharp_use_random_port ? pyeval('find_free_port()') : 2000
+let g:OmniSharp_port = get(g:, 'OmniSharp_port', s:OmniSharp_default_port)
 
 "Setup variable defaults
 "Default value for the server address
@@ -69,31 +67,33 @@ let g:OmniSharp_start_without_solution = get(g:, 'OmniSharp_start_without_soluti
 let g:OmniSharp_server_config_name =
 \ get(g:, 'OmniSharp_server_config_name', 'omnisharp.json')
 
-if g:Omnisharp_stop_server==1
-  au VimLeavePre * call OmniSharp#AskStopServerIfRunning()
+if g:Omnisharp_stop_server == 1
+  autocmd VimLeavePre * call OmniSharp#AskStopServerIfRunning()
 endif
 
-if !exists('g:Omnisharp_highlight_user_types')
-  let g:Omnisharp_highlight_user_types = 0
-endif
+" Initialize OmniSharp as an asyncomplete source
+autocmd User asyncomplete_setup call asyncomplete#register_source({
+\   'name': 'OmniSharp',
+\   'whitelist': ['cs'],
+\   'completor': function('asyncomplete#sources#OmniSharp#completor')
+\ })
 
 if !exists('g:OmniSharp_selector_ui')
   let g:OmniSharp_selector_ui = get(filter(
   \   ['unite', 'ctrlp', 'fzf'],
-  \   '!empty(globpath(&runtimepath, printf("autoload/%s.vim", v:val), 1))'
+  \   '!empty(globpath(&runtimepath, printf("plugin/%s.vim", v:val), 1))'
   \ ), 0, '')
 endif
 
 " Set g:OmniSharp_server_type to 'roslyn' or 'v1'
-let g:OmniSharp_server_type = get(g:, 'OmniSharp_server_type', 'v1')
+let g:OmniSharp_server_type = get(g:, 'OmniSharp_server_type', 'roslyn')
+
+" Use mono to start the roslyn server on *nix
+let g:OmniSharp_server_use_mono = get(g:, 'OmniSharp_server_use_mono', 0)
 
 " Set default for snippet based completions
 let g:OmniSharp_want_snippet = get(g:, 'OmniSharp_want_snippet', 0)
 
-if !exists('g:OmniSharp_server_path')
-  if g:OmniSharp_server_type ==# 'v1'
-    let g:OmniSharp_server_path = join([expand('<sfile>:p:h:h'), 'server', 'OmniSharp', 'bin', 'Debug', 'OmniSharp.exe'], '/')
-  else
-    let g:OmniSharp_server_path = join([expand('<sfile>:p:h:h'), 'omnisharp-roslyn', 'artifacts', 'scripts', 'Omnisharp'], '/')
-  endif
+if !exists('g:OmniSharp_prefer_global_sln')
+  let g:OmniSharp_prefer_global_sln = 0
 endif

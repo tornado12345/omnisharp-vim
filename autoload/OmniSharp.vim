@@ -4,36 +4,49 @@ endif
 
 let s:save_cpo = &cpo
 set cpo&vim
+"
+"Load python/omnisharp/OmniSharp.py
+let s:py_path = OmniSharp#util#path_join(['python', 'omnisharp'])
+exec "python sys.path.append(r'" . s:py_path . "')"
+exec 'pyfile ' . fnameescape(OmniSharp#util#path_join(['python', 'omnisharp', 'OmniSharp.py']))
 
-let s:dir_separator = fnamemodify('.', ':p')[-1 :]
 let s:server_files = '*.sln'
-let s:roslyn_server_files = 'project.json'
 let s:allUserTypes = ''
 let s:allUserInterfaces = ''
 let s:generated_snippets = {}
-let s:omnisharp_last_completion_dictionary = {}
+let s:last_completion_dictionary = {}
 let g:serverSeenRunning = 0
+
+let s:is_vimproc = 0
+silent! let s:is_vimproc = vimproc#version()
+
+function! OmniSharp#GetCompletions(partial, ...) abort
+  let completions = pyeval(printf('getCompletions(%s)', string(a:partial)))
+  let s:last_completion_dictionary = {}
+  for completion in completions
+    let s:last_completion_dictionary[get(completion, 'word')] = completion
+  endfor
+  if a:0 > 0
+    " If a callback has been passed in, then use it
+    call a:1(completions)
+  else
+    " Otherwise just return the results
+    return completions
+  endif
+endfunction
 
 function! OmniSharp#Complete(findstart, base) abort
   if a:findstart
-    "store the current cursor position
-    let s:column = col('.')
     "locate the start of the word
     let line = getline('.')
     let start = col('.') - 1
-    let s:textBuffer = getline(1, '$')
     while start > 0 && line[start - 1] =~# '\v[a-zA-z0-9_]'
       let start -= 1
     endwhile
 
     return start
   else
-    let omnisharp_last_completion_result =  pyeval('Completion().get_completions("s:column", "a:base")')
-    let s:omnisharp_last_completion_dictionary = {}
-    for completion in omnisharp_last_completion_result
-        let s:omnisharp_last_completion_dictionary[get(completion, 'word')] = completion
-    endfor
-    return omnisharp_last_completion_result
+    return OmniSharp#GetCompletions(a:base)
   endif
 endfunction
 
@@ -127,27 +140,39 @@ endfunction
 
 function! OmniSharp#JumpToLocation(filename, line, column) abort
   if a:filename !=# ''
-    if a:filename !=# bufname('%')
-      exec 'e! ' . fnameescape(a:filename)
+    if fnamemodify(a:filename, ':p') !=# expand('%:p')
+      try
+        execute 'edit ' . fnameescape(a:filename)
+      catch /^Vim(edit):E37/
+        echohl ErrorMsg | echomsg 'No write since last change' | echohl None
+        return 0
+      endtry
     endif
-    "row is 1 based, column is 0 based
     call cursor(a:line, a:column)
+    return 1
   endif
 endfunction
 
-function! OmniSharp#SelectorPluginError()
-  echoerr 'No selector plugin found.  Please install unite.vim, ctrlp.vim or fzf.vim'
-endfunction
-
-function! OmniSharp#FindSymbol() abort
+function! OmniSharp#FindSymbol(...) abort
+  let filter = a:0 > 0 ? a:1 : ''
+  if !OmniSharp#ServerIsRunning()
+    return
+  endif
+  let quickfixes = pyeval(printf('findSymbols(%s)', string(filter)))
+  if empty(quickfixes)
+    echo 'No symbols found'
+    return
+  endif
   if g:OmniSharp_selector_ui ==? 'unite'
-    call unite#start([['OmniSharp/findsymbols']])
+    call unite#start([['OmniSharp/findsymbols', quickfixes]])
   elseif g:OmniSharp_selector_ui ==? 'ctrlp'
+    call ctrlp#OmniSharp#findsymbols#setsymbols(quickfixes)
     call ctrlp#init(ctrlp#OmniSharp#findsymbols#id())
   elseif g:OmniSharp_selector_ui ==? 'fzf'
-    call fzf#OmniSharp#findsymbols()
+    call fzf#OmniSharp#findsymbols(quickfixes)
   else
-    call OmniSharp#SelectorPluginError()
+    call setqflist(quickfixes)
+    botright cwindow 4
   endif
 endfunction
 
@@ -159,26 +184,87 @@ function! OmniSharp#FindType() abort
   elseif g:OmniSharp_selector_ui ==? 'fzf'
     call fzf#OmniSharp#findtypes()
   else
-    call OmniSharp#SelectorPluginError()
+    call setqflist(quickfixes)
+    botright cwindow 4
   endif
 endfunction
 
+" This function returns a count of the currently available code actions. It also
+" uses the code actions to pre-populate the code actions for
+" OmniSharp#GetCodeActions, and clears them on CursorMoved.
+"
+" If a callback function is passed in, the callback will also be called on
+" CursorMoved, allowing this function to be used to set up a temporary "Code
+" actions available" flag, e.g. in the statusline or signs column, and the
+" callback function can be used to clear the flag.
+function! OmniSharp#CountCodeActions(...) abort
+  let v = g:OmniSharp_server_type ==# 'roslyn' ? 'v2' : 'v1'
+  let s:actions = pyeval(printf('getCodeActions("normal", %s)', string(v)))
+
+  " v:t_func was added in vim8 - this form is backwards-compatible
+  if a:0 && type(a:1) == type(function("tr"))
+    let s:cb = a:1
+  endif
+
+  function! s:CleanupCodeActions() abort
+    unlet s:actions
+    if exists('s:cb')
+      call s:cb()
+      unlet s:cb
+    endif
+    autocmd! OmniSharp#CountCodeActions
+  endfunction
+
+  augroup OmniSharp#CountCodeActions
+    autocmd!
+    autocmd CursorMoved <buffer> call s:CleanupCodeActions()
+    autocmd CursorMovedI <buffer> call s:CleanupCodeActions()
+    autocmd BufLeave <buffer> call s:CleanupCodeActions()
+  augroup END
+
+  return len(s:actions)
+endfunction
+
 function! OmniSharp#GetCodeActions(mode) range abort
+  let v = g:OmniSharp_server_type ==# 'roslyn' ? 'v2' : 'v1'
+  if exists('s:actions')
+    let actions = s:actions
+  else
+    let actions = pyeval(printf('getCodeActions(%s, %s)', string(a:mode), string(v)))
+  endif
+  if empty(actions)
+    echo 'No code actions found'
+    return
+  endif
   if g:OmniSharp_selector_ui ==? 'unite'
     let context = {'empty': 0, 'auto_resize': 1}
-    call unite#start([['OmniSharp/findcodeactions', a:mode]], context)
+    call unite#start([['OmniSharp/findcodeactions', a:mode, actions, v]], context)
   elseif g:OmniSharp_selector_ui ==? 'ctrlp'
-    let actions = pyeval(printf('getCodeActions(%s)', string(a:mode)))
-    if empty(actions)
-      echo 'No code actions found'
-      return
-    endif
     call ctrlp#OmniSharp#findcodeactions#setactions(a:mode, actions)
     call ctrlp#init(ctrlp#OmniSharp#findcodeactions#id())
   elseif g:OmniSharp_selector_ui ==? 'fzf'
-    call fzf#OmniSharp#getcodeactions(a:mode)
+    call fzf#OmniSharp#getcodeactions(a:mode, actions)
   else
-    call OmniSharp#SelectorPluginError()
+    let message = []
+    let i = 0
+    for action in actions
+      let i += 1
+      call add(message, printf(' %2d. %s', i, v ==# 'v1' ? action : action.Name))
+    endfor
+    call add(message, 'Enter an action number, or just hit Enter to cancel: ')
+    let selection = str2nr(input(join(message, "\n")))
+    if type(selection) == type(0) && selection > 0 && selection <= i
+      if v ==# 'v1'
+        let command = printf('runCodeAction(%s, %d)', string(a:mode), selection - 1)
+      else
+        let action = actions[selection - 1]
+        let command = substitute(get(action, 'Identifier'), '''', '\\''', 'g')
+        let command = printf('runCodeAction(''%s'', ''%s'', ''v2'')', a:mode, command)
+      endif
+      if !pyeval(command)
+        echo 'No action taken'
+      endif
+    endif
   endif
 endfunction
 
@@ -235,23 +321,6 @@ function! OmniSharp#CodeCheck() abort
   return get(b:, 'codecheck', [])
 endfunction
 
-" Jump to first scratch window visible in current tab, or create it.
-" This is useful to accumulate results from successive operations.
-" Global function that can be called from other scripts.
-function! s:GoScratch() abort
-  if bufwinnr('__OmniSharpScratch__') == -1
-    "botright new __OmniSharpScratch__
-    botright split __OmniSharpScratch__
-    setlocal buftype=nofile bufhidden=hide noswapfile nolist nobuflisted nospell
-  endif
-  for i in range(1, winnr('$'))
-    execute i . 'wincmd w'
-    if &buftype ==# 'nofile' && bufname('%') ==# '__OmniSharpScratch__'
-      break
-    endif
-  endfor
-endfunction
-
 function! OmniSharp#TypeLookupWithoutDocumentation() abort
   call OmniSharp#TypeLookup('False')
 endfunction
@@ -264,16 +333,13 @@ function! OmniSharp#TypeLookup(includeDocumentation) abort
   let type = ''
 
   if g:OmniSharp_typeLookupInPreview || a:includeDocumentation ==# 'True'
+    let s:documentation = ''
     python typeLookup("type")
-    let preWinNr = winnr()
-    call s:GoScratch()
-    python vim.current.window.height = 5
     let doc = get(s:, 'documentation', '')
-    set modifiable
-    exec 'python vim.current.buffer[:] = ["' . type . '"] + """' . doc . '""".splitlines()'
-    set nomodifiable
-    "Return to original window
-    execute preWinNr . 'wincmd w'
+    if len(doc) > 0
+      let doc = "\n\n" . doc
+    endif
+    call s:writeToPreview(type . doc)
   else
     let line = line('.')
     let found_line_in_loc_list = 0
@@ -377,30 +443,42 @@ function! OmniSharp#RunTests(mode) abort
 endfunction
 
 function! OmniSharp#EnableTypeHighlightingForBuffer() abort
-  hi link CSharpUserType Type
-  exec 'syn keyword CSharpUserType ' . s:allUserTypes
-  exec 'syn keyword csInterfaceDeclaration ' . s:allUserInterfaces
+  highlight default link csUserType Type
+  if !empty(s:allUserTypes)
+    exec 'syn keyword csUserType ' . s:allUserTypes
+  endif
+  highlight default link csUserInterface Include
+  if !empty(s:allUserInterfaces)
+    exec 'syn keyword csUserInterface ' . s:allUserInterfaces
+  endif
+  highlight default link csUserAttribute Include
+  if !empty(s:allUserAttributes)
+    exec 'syn keyword csUserAttribute ' . s:allUserAttributes
+  endif
 endfunction
 
 function! OmniSharp#EnableTypeHighlighting() abort
-
-  if !OmniSharp#ServerIsRunning() || !empty(s:allUserTypes)
+  if !OmniSharp#ServerIsRunning()
     return
   endif
 
-  python lookupAllUserTypes()
+  if g:OmniSharp_server_type ==# 'roslyn'
+    python lookupAllUserTypes()
+  else
+    python lookupAllUserTypesLegacy()
+  endif
 
   let startBuf = bufnr('%')
   " Perform highlighting for existing buffers
   bufdo if &ft == 'cs' | call OmniSharp#EnableTypeHighlightingForBuffer() | endif
-exec 'b '. startBuf
+  exec 'b '. startBuf
 
-call OmniSharp#EnableTypeHighlightingForBuffer()
+  call OmniSharp#EnableTypeHighlightingForBuffer()
 
-augroup _omnisharp
-  au!
-  autocmd BufRead *.cs call OmniSharp#EnableTypeHighlightingForBuffer()
-augroup END
+  augroup _omnisharp
+    autocmd!
+    autocmd BufRead *.cs call OmniSharp#EnableTypeHighlightingForBuffer()
+  augroup END
 endfunction
 
 function! OmniSharp#ReloadSolution() abort
@@ -472,15 +550,18 @@ function! OmniSharp#StartServer() abort
   if empty(solution_files)
     return
   endif
+
+  let l:command = []
+
   if len(solution_files) == 1
-    call OmniSharp#StartServerSolution(solution_files[0])
+    let l:command = OmniSharp#util#get_start_cmd(solution_files[0])
   elseif g:OmniSharp_sln_list_name !=# ''
     echom 'Started with sln: ' . g:OmniSharp_sln_list_name
-    call OmniSharp#StartServerSolution( g:OmniSharp_sln_list_name )
+    let l:command = OmniSharp#util#get_start_cmd(g:OmniSharp_sln_list_name)
   elseif g:OmniSharp_sln_list_index > -1 &&
   \     g:OmniSharp_sln_list_index < len(solution_files)
     echom 'Started with sln: ' . solution_files[g:OmniSharp_sln_list_index]
-    call OmniSharp#StartServerSolution( solution_files[g:OmniSharp_sln_list_index]  )
+    let l:command = OmniSharp#util#get_start_cmd(solution_files[g:OmniSharp_sln_list_index])
   else
     echom 'sln: ' . g:OmniSharp_sln_list_name
     let index = 1
@@ -503,53 +584,15 @@ function! OmniSharp#StartServer() abort
       return
     endif
 
-    call OmniSharp#StartServerSolution(solution_files[option - 1])
+    let l:command = OmniSharp#util#get_start_cmd(solution_files[option - 1])
   endif
-endfunction
 
-function! OmniSharp#ResolveLocalConfig(solutionPath) abort
-  let result = ''
-  let configPath = fnamemodify(a:solutionPath, ':p:h')
-  \ . s:dir_separator
-  \ . g:OmniSharp_server_config_name
+  if l:command ==# []
+    echoerr 'Could not determinet the command to start the OmniSharp server!'
+    return
+  endif
 
-  if filereadable(configPath)
-    let result = ' -config ' . shellescape(configPath, 1)
-  endif
-  return result
-endfunction
-
-function! OmniSharp#StartServerSolution(solutionPath) abort
-  let solutionPath = a:solutionPath
-  if fnamemodify(solutionPath, ':t') ==? s:roslyn_server_files
-    let solutionPath = fnamemodify(solutionPath, ':h')
-  endif
-  let g:OmniSharp_running_slns += [solutionPath]
-  let port = exists('b:OmniSharp_port') ? b:OmniSharp_port : g:OmniSharp_port
-  let command = shellescape(g:OmniSharp_server_path, 1)
-  \ . ' -p ' . port
-  \ . ' -s ' . shellescape(solutionPath, 1)
-  if g:OmniSharp_server_type !=# 'roslyn'
-    let command .= OmniSharp#ResolveLocalConfig(solutionPath)
-  endif
-  if !has('win32') && !has('win32unix') && g:OmniSharp_server_type !=# 'roslyn'
-    let command = 'mono ' . command
-  endif
-  call OmniSharp#RunAsyncCommand(command)
-endfunction
-
-function! OmniSharp#RunAsyncCommand(command) abort
-  let is_vimproc = 0
-  silent! let is_vimproc = vimproc#version()
-  if exists(':Dispatch') == 2
-    call dispatch#start(a:command, {'background': 1})
-  else
-    if is_vimproc
-      call vimproc#system_gui(substitute(a:command, '\\', '\/', 'g'))
-    else
-      echoerr 'Please install either vim-dispatch or vimproc plugin to use this feature'
-    endif
-  endif
+  call OmniSharp#proc#RunAsyncCommand(command)
 endfunction
 
 function! OmniSharp#AddToProject() abort
@@ -576,6 +619,7 @@ function! OmniSharp#StopServer(...) abort
 
   if force || OmniSharp#ServerIsRunning()
     python getResponse("/stopserver")
+    call OmniSharp#proc#StopJob()
     let g:OmniSharp_running_slns = []
   endif
 endfunction
@@ -605,26 +649,26 @@ function! OmniSharp#ExpandAutoCompleteSnippet()
     return
   endif
 
-  if !exists("*UltiSnips#AddSnippetWithPriority")
-    echoerr "g:OmniSharp_want_snippet is enabled but this requires the UltiSnips plugin and it is not installed."
+  if empty(globpath(&runtimepath, 'plugin/UltiSnips.vim'))
+    echoerr 'g:OmniSharp_want_snippet is enabled but this requires the UltiSnips plugin and it is not installed.'
     return
   endif
- 
+
   let line = strpart(getline('.'), 0, col('.')-1)
   let remove_whitespace_regex = '^\s*\(.\{-}\)\s*$'
- 
+
   let completion = matchstr(line, '.*\zs\s\W.\+(.*)')
   let completion = substitute(completion, remove_whitespace_regex, '\1', '')
- 
+
   let should_expand_completion = len(completion) != 0
-  
+
   if should_expand_completion
     let completion = split(completion, '\.')[-1]
     let completion = split(completion, 'new ')[-1]
     let completion = split(completion, '= ')[-1]
 
-    if has_key(s:omnisharp_last_completion_dictionary, completion)
-      let snippet = get(get(s:omnisharp_last_completion_dictionary, completion, ''), 'snip','')
+    if has_key(s:last_completion_dictionary, completion)
+      let snippet = get(get(s:last_completion_dictionary, completion, ''), 'snip','')
       if !has_key(s:generated_snippets, completion)
         call UltiSnips#AddSnippetWithPriority(completion, snippet, completion, 'iw', 'cs', 1)
         let s:generated_snippets[completion] = snippet
@@ -638,33 +682,63 @@ endfunction
 function! s:find_solution_files() abort
   "get the path for the current buffer
   let dir = expand('%:p:h')
+  let lastfolder = ''
   let solution_files = []
 
-  while empty(solution_files)
-    let solution_files += s:globpath(dir , '*.sln')
-    if g:OmniSharp_server_type ==# 'roslyn'
-      let solution_files += s:globpath(dir, 'project.json')
+  while dir !=# lastfolder
+    if empty(solution_files)
+      let solution_files += s:globpath(dir, '*.sln')
+      if g:OmniSharp_server_type ==# 'roslyn'
+        let solution_files += s:globpath(dir, 'project.json')
+      endif
+
+      call filter(solution_files, 'filereadable(v:val)')
     endif
 
-    call filter(solution_files, 'filereadable(v:val)')
+    if g:OmniSharp_server_type ==# 'roslyn' && g:OmniSharp_prefer_global_sln
+      let global_solution_files = s:globpath(dir, 'global.json')
+      call filter(global_solution_files, 'filereadable(v:val)')
+      if !empty(global_solution_files)
+        let solution_files = [dir]
+        break
+      endif
+    endif
 
     let lastfolder = dir
     let dir = fnamemodify(dir, ':h')
-    if dir ==# lastfolder
-      break
-    endif
   endwhile
 
   if empty(solution_files) && g:OmniSharp_start_without_solution
-    let solution_files = ['.']
+    let solution_files = [getcwd()]
   endif
 
   return solution_files
 endfunction
 
 function! s:json_decode(json) abort
+  if a:json == ''
+    throw 'Empty JSON response from server'
+  endif
+
   let [null, true, false] = [0, 1, 0]
-  sandbox return eval(a:json)
+  try
+    sandbox return eval(a:json)
+  catch
+    throw 'Invalid JSON response from server: ' . a:json
+  endtry
+endfunction
+
+" Manually write content to the preview window.
+" Opens a preview window to a scratch buffer named '__OmniSharpScratch__'
+function! s:writeToPreview(content)
+  silent pedit __OmniSharpScratch__
+  silent wincmd P
+  setlocal modifiable noreadonly
+  setlocal nobuflisted buftype=nofile bufhidden=wipe
+  silent put =a:content
+  0d_
+  setlocal nomodifiable readonly
+  silent wincmd p
 endfunction
 
 if has('patch-7.4.279')
@@ -679,3 +753,5 @@ endif
 
 let &cpo = s:save_cpo
 unlet s:save_cpo
+
+" vim: shiftwidth=2
