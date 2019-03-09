@@ -6,7 +6,6 @@ if ( exists('g:OmniSharp_loaded_ctrlp_findsymbols') && g:OmniSharp_loaded_ctrlp_
 endif
 let g:loaded_ctrlp_OmniSharp_findsymbols = 1
 
-
 " Add this extension's settings to g:ctrlp_ext_vars
 "
 " Required:
@@ -79,7 +78,7 @@ function! ctrlp#OmniSharp#findsymbols#accept(mode, str) abort
     endif
   endfor
   echo quickfix.filename
-  call  OmniSharp#JumpToLocation(quickfix.filename, quickfix.lnum, quickfix.col)
+  call  OmniSharp#JumpToLocation(quickfix.filename, quickfix.lnum, quickfix.col, 0)
 endfunction
 
 " Give the extension an ID
@@ -90,4 +89,4 @@ function! ctrlp#OmniSharp#findsymbols#id() abort
   return s:id
 endfunction
 
-" vim:nofen:fdl=0:ts=2:sw=2:sts=2
+" vim:et:sw=2:sts=2
