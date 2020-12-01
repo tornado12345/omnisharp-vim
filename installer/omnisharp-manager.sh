@@ -1,7 +1,7 @@
 #!/bin/sh
 # OmniSharp-Roslyn Installer
 #
-# Works on: Linux, macOS & Cygwin/WSL
+# Works on: Linux, macOS & Cygwin/WSL & MinGW
 
 usage() {
     printf "usage: %s [-HMuh] [-v version] [-l location]\\n" "$0"
@@ -18,30 +18,28 @@ Options:
     -h            | Help message
     -H            | Install the HTTP version of the server
     -M            | Use the system Mono rather than the bundled Mono
+    -W            | Use the Windows version of the server (used from WSL)
 EOF
 }
 
 get_latest_version() {
-    if [ "$(command -v curl)" ]; then
-        curl --silent "https://api.github.com/repos/OmniSharp/omnisharp-roslyn/releases/latest"
-    elif [ "$(command -v wget)" ]; then
+    if command -v curl >/dev/null 2>&1 ; then
+        curl --user-agent "curl" --silent "https://api.github.com/repos/OmniSharp/omnisharp-roslyn/releases/latest"
+    elif command -v wget >/dev/null 2>&1 ; then
         wget -qO- "https://api.github.com/repos/OmniSharp/omnisharp-roslyn/releases/latest"
-    fi | grep '"tag_name":' | sed 's/.*"\([^"]\+\)".*/\1/'
+    fi | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/'
 }
 
 location="$HOME/.omnisharp/"
 
-# TODO: Remove this default when omnisharp-roslyn #1274 is fixed:
-# https://github.com/OmniSharp/omnisharp-roslyn/issues/1274
-version='v1.32.1'
-
-while getopts v:l:HMuh o "$@"
+while getopts v:l:HMWuh o "$@"
 do
     case "$o" in
         v)      version="$OPTARG";;
         l)      location="$OPTARG";;
         H)      http=".http";;
         M)      mono=1;;
+        W)      windows=1;;
         u)      usage && exit 0;;
         h)      print_help && exit 0;;
         [?])    usage && exit 1;;
@@ -49,16 +47,16 @@ do
 done
 
 # Ensure that either 'curl' or 'wget' is installed
-if [ ! "$(command -v curl)" ] && [ ! "$(command -v wget)" ]; then
+if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1 ; then
     echo "Error: the installer requires either 'curl' or 'wget'"
     exit 1
 fi
 
 # Check that either 'tar' or 'unzip' is installed
 # (and set the file extension appropriately)
-if [ "$(command -v tar)" ] && [ "$(command -v gzip)" ]; then
+if command -v tar >/dev/null 2>&1 && command -v gzip >/dev/null 2>&1 ; then
     ext="tar.gz"
-elif [ "$(command -v unzip)" ]; then
+elif command -v unzip >/dev/null 2>&1 ; then
     ext="zip"
 else
     echo "Error: the installer requires either 'tar' or 'unzip'"
@@ -83,10 +81,19 @@ case "$(uname -s)" in
         if [ "$(uname -o)" = "Cygwin" ]; then
             os="win-${machine}"
 
-            if [ "$(command -v unzip)" ]; then
+            if command -v unzip >/dev/null 2>&1 ; then
                 ext="zip"
             else
                 echo "Error: the installer requires 'unzip' to work on Cygwin"
+                exit 1
+            fi
+        elif [ "$(uname -o)" = "Msys" ]; then
+            os="win-${machine}"
+
+            if command -v unzip >/dev/null 2>&1 ; then
+                ext="zip"
+            else
+                echo "Error: the installer requires 'unzip' to work on MinGW"
                 exit 1
             fi
         else
@@ -98,6 +105,17 @@ esac
 
 [ -n "$mono" ] && os="mono"
 
+if [ -n "$windows" ]; then
+  os="win-${machine}"
+
+  if command -v unzip >/dev/null 2>&1 ; then
+    ext="zip"
+  else
+    echo "Error: the installer requires 'unzip' to work on WSL"
+    exit 1
+  fi
+fi
+
 file_name="omnisharp${http}-${os}.${ext}"
 
 [ -z "$version" ] && version="$(get_latest_version)"
@@ -106,31 +124,40 @@ base_url="https://github.com/OmniSharp/omnisharp-roslyn/releases/download"
 full_url="${base_url}/${version}/${file_name}"
 # echo "$full_url"
 
-rm -r "$location"
-mkdir -p "$location"
+download_location="${location}-${version}"
 
-if [ "$(command -v curl)" ]; then
-    curl -L "$full_url" -o "$location/$file_name"
-elif [ "$(command -v wget)" ]; then
-    wget -P "$location" "$full_url"
+rm -rf "$download_location"
+mkdir -p "$download_location"
+
+if command -v curl >/dev/null 2>&1 ; then
+    curl -L "$full_url" -o "$download_location/$file_name"
+elif command -v wget >/dev/null 2>&1 ; then
+    wget -P "$download_location" "$full_url"
 fi
 
 # Check if the server was successfully downloaded
-if [ $? -gt 0 ] || [ ! -f "$location/$file_name" ]; then
+if [ $? -gt 0 ] || [ ! -f "$download_location/$file_name" ]; then
     echo "Error: failed to download the server, possibly a network issue"
     exit 1
 fi
 
+set -eu
 if [ "$ext" = "zip" ]; then
-    unzip "$location/$file_name" -d "$location/"
-    chmod +x $(find "$location" -type f)
+    unzip "$download_location/$file_name" -d "$download_location/"
+    chmod +x $(find "$download_location" -type f)
 else
-    tar -zxvf "$location/$file_name" -C "$location/"
+    tar -zxvf "$download_location/$file_name" -C "$download_location/"
 fi
+
+rm -rf "$location"
+mv "$download_location" "$location"
+set +eu
 
 # If using the system Mono, make the files executable
 if [ -n "$mono" ] && [ $mono -eq 1 ]; then
     chmod +x $(find "$location" -type f)
 fi
+
+echo "$version" > "$location/OmniSharpInstall-version.txt"
 
 exit 0

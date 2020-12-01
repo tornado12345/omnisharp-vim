@@ -1,7 +1,8 @@
 let s:save_cpo = &cpoptions
 set cpoptions&vim
 
-let s:jobs = {}
+let s:jobs = get(s:, 'jobs', {})
+let s:channels = get(s:, 'channels', {})
 
 " Neovim jobs {{{ "
 
@@ -10,26 +11,52 @@ function! OmniSharp#proc#supportsNeovimJobs() abort
 endfunction
 
 function! OmniSharp#proc#neovimOutHandler(job_id, data, event) dict abort
-  let l:message = printf('%s: %s',a:event,string(a:data))
-  echom l:message
+  if get(g:, 'OmniSharp_proc_debug')
+    echom printf('%s: %s', string(a:event), string(a:data))
+  endif
+  if g:OmniSharp_server_stdio
+    let job = s:channels[a:job_id]
+
+    let messages = a:data[:-2]
+
+    if len(a:data) > 1
+        let messages[0] = job.partial . messages[0]
+        let job.partial = a:data[-1]
+    else
+        let job.partial = job.partial . a:data[0]
+    endif
+
+    for message in messages
+      if message =~# "^\uFEFF"
+        " Strip BOM
+        let message = substitute(message, "^\uFEFF", '', '')
+      endif
+      call OmniSharp#stdio#HandleResponse(job, message)
+    endfor
+  endif
 endfunction
 
 function! OmniSharp#proc#neovimErrHandler(job_id, data, event) dict abort
-  let l:message = printf('%s: %s',a:event,string(a:data))
-  call OmniSharp#util#EchoErr(l:message)
+  if type(a:data) == type([]) && len(a:data) == 1 && a:data[0] =~# "^\uFEFF$"
+    " Ignore BOM
+    return
+  endif
+  if type(a:data) == type([]) && len(a:data) == 1 && a:data[0] ==# ''
+    " Ignore empty
+    return
+  endif
+  let message = printf('%s: %s', a:event, string(a:data))
+  call OmniSharp#util#EchoErr(message)
 endfunction
 
 function! OmniSharp#proc#neovimExitHandler(job_id, data, event) dict abort
   let jobkey = ''
-  for [key, id] in items(s:jobs)
-    if a:job_id == id
+  for [key, val] in items(s:jobs)
+    if a:job_id == val.job_id
       let jobkey = key
       break
     endif
   endfor
-  if !empty(jobkey) && has_key(s:jobs, jobkey)
-    call remove(s:jobs, jobkey)
-  endif
 endfunction
 
 function! OmniSharp#proc#neovimJobStart(command) abort
@@ -41,10 +68,18 @@ function! OmniSharp#proc#neovimJobStart(command) abort
   call s:debug(a:command)
   let opts = {'on_stderr': 'OmniSharp#proc#neovimErrHandler',
              \  'on_exit': 'OmniSharp#proc#neovimExitHandler'}
-  if g:OmniSharp_proc_debug
+  if g:OmniSharp_server_stdio || get(g:, 'OmniSharp_proc_debug')
     let opts['on_stdout'] = 'OmniSharp#proc#neovimOutHandler'
   endif
-  return jobstart(a:command, opts)
+  let job = {
+  \ 'start_time': reltime(),
+  \ 'job_id': jobstart(a:command, opts),
+  \ 'partial': ''
+  \}
+  let job.pid = jobpid(job.job_id)
+  let s:channels[job.job_id] = job
+  call OmniSharp#log#Log(job, split(execute('version'), "\n")[0])
+  return job
 endfunction
 
 " }}} Neovim jobs "
@@ -56,12 +91,26 @@ function! OmniSharp#proc#supportsVimJobs() abort
 endfunction
 
 function! OmniSharp#proc#vimOutHandler(channel, message) abort
-  echom printf('%s: %s', string(a:channel), string(a:message))
+  if get(g:, 'OmniSharp_proc_debug')
+    echom printf('%s: %s', string(a:channel), string(a:message))
+  endif
+  if g:OmniSharp_server_stdio
+    let message = a:message
+    if message =~# "^\uFEFF"
+      " Strip BOM
+      let message = substitute(message, "^\uFEFF", '', '')
+    endif
+    let job = s:channels[ch_info(a:channel).id]
+    call OmniSharp#stdio#HandleResponse(job, message)
+  endif
 endfunction
 
 function! OmniSharp#proc#vimErrHandler(channel, message) abort
-  let l:message = printf('%s: %s', string(a:channel), string(a:message))
-  call OmniSharp#util#EchoErr(l:message)
+  if ch_status(a:channel) ==# 'closed'
+    return
+  endif
+  let message = printf('%s: %s', string(a:channel), string(a:message))
+  call OmniSharp#util#EchoErr(message)
 endfunction
 
 function! OmniSharp#proc#vimJobStart(command) abort
@@ -72,10 +121,21 @@ function! OmniSharp#proc#vimJobStart(command) abort
   call s:debug('Using vim job_start to start the following command:')
   call s:debug(a:command)
   let opts = {'err_cb': 'OmniSharp#proc#vimErrHandler'}
-  if g:OmniSharp_proc_debug
+  if g:OmniSharp_server_stdio || get(g:, 'OmniSharp_proc_debug')
     let opts['out_cb'] = 'OmniSharp#proc#vimOutHandler'
   endif
-  return job_start(a:command, opts)
+  if has('patch-8.1.350')
+    let opts.noblock = 1
+  endif
+  let job = {
+  \ 'start_time': reltime(),
+  \ 'job_id': job_start(a:command, opts)
+  \}
+  let job.pid = job_info(job.job_id).process
+  let channel_id = ch_info(job_getchannel(job.job_id)).id
+  let s:channels[channel_id] = job
+  call OmniSharp#log#Log(job, join(split(execute('version'), "\n")[0:1], ', '))
+  return job
 endfunction
 
 " }}} Vim jobs "
@@ -83,7 +143,7 @@ endfunction
 " vim-dispatch {{{ "
 
 function! OmniSharp#proc#supportsVimDispatch() abort
-  return exists(':Dispatch') == 2
+  return exists(':Dispatch') == 2 && !g:OmniSharp_server_stdio
 endfunction
 
 function! OmniSharp#proc#dispatchStart(command) abort
@@ -102,9 +162,10 @@ endfunction
 " vim-proc {{{ "
 
 function! OmniSharp#proc#supportsVimProc() abort
-  let l:is_vimproc = 0
-  silent! let l:is_vimproc = vimproc#version()
-  return l:is_vimproc
+  if g:OmniSharp_server_stdio | return 0 | endif
+  let is_vimproc = 0
+  silent! let is_vimproc = vimproc#version()
+  return is_vimproc
 endfunction
 
 function! OmniSharp#proc#vimprocStart(command) abort
@@ -120,53 +181,69 @@ endfunction
 
 " public functions {{{ "
 
-function! OmniSharp#proc#RunAsyncCommand(command, jobkey) abort
-  if OmniSharp#proc#IsJobRunning(a:jobkey)
-    return
-  endif
+function! OmniSharp#proc#Start(command, jobkey) abort
   if OmniSharp#proc#supportsNeovimJobs()
-    let job_id = OmniSharp#proc#neovimJobStart(a:command)
-    if job_id > 0
-      let s:jobs[a:jobkey] = job_id
+    let job = OmniSharp#proc#neovimJobStart(a:command)
+    if job.job_id > 0
+      let s:jobs[a:jobkey] = job
     else
-      call OmniSharp#util#EchoErr('command is not executable: ' . a:command[0])
+      call OmniSharp#util#EchoErr('Command is not executable: ' . a:command[0])
     endif
   elseif OmniSharp#proc#supportsVimJobs()
-    let job_id = OmniSharp#proc#vimJobStart(a:command)
-    if job_status(job_id) ==# 'run'
-      let s:jobs[a:jobkey] = job_id
+    let job = OmniSharp#proc#vimJobStart(a:command)
+    if job_status(job.job_id) ==# 'run'
+      let s:jobs[a:jobkey] = job
     else
-      call OmniSharp#util#EchoErr('could not run command: ' . join(a:command, ' '))
+      call OmniSharp#util#EchoErr('Could not run command: ' . join(a:command))
     endif
   elseif OmniSharp#proc#supportsVimDispatch()
-    let req = OmniSharp#proc#dispatchStart(a:command)
-    let s:jobs[a:jobkey] = req
+    let job = OmniSharp#proc#dispatchStart(a:command)
+    let s:jobs[a:jobkey] = job
   elseif OmniSharp#proc#supportsVimProc()
-    let proc = OmniSharp#proc#vimprocStart(a:command)
-    let s:jobs[a:jobkey] = proc
+    let job = OmniSharp#proc#vimprocStart(a:command)
+    let s:jobs[a:jobkey] = job
   else
-    call OmniSharp#util#EchoErr('Please use neovim, or vim 8.0+ or install either vim-dispatch or vimproc.vim plugin to use this feature')
+    call OmniSharp#util#EchoErr(
+    \ 'Please use neovim, or vim 8.0+ or install either vim-dispatch or ' .
+    \ 'vimproc.vim plugin to use this feature')
   endif
+  if type(job) == type({})
+    let job.sln_or_dir = a:jobkey
+    let job.loaded = 0
+    call OmniSharp#log#Log(job, '')
+    call OmniSharp#log#Log(job, 'OmniSharp server started.')
+    call OmniSharp#log#Log(job, '    Path: ' . OmniSharp#util#GetServerPath())
+    call OmniSharp#log#Log(job, '    Target: ' . a:jobkey)
+    call OmniSharp#log#Log(job, '    PID: ' . job.pid)
+    call OmniSharp#log#Log(job, '    Command: ' . join(a:command), 1)
+    call OmniSharp#log#Log(job, '')
+    silent doautocmd <nomodeline> User OmniSharpStarted
+  endif
+  return job
 endfunction
 
 function! OmniSharp#proc#StopJob(jobkey) abort
   if !OmniSharp#proc#IsJobRunning(a:jobkey)
     return
   endif
-  let job_id = s:jobs[a:jobkey]
+  let job = s:jobs[a:jobkey]
+  let job.stopping = 1
 
   if OmniSharp#proc#supportsNeovimJobs()
-    call jobstop(job_id)
+    call jobstop(job.job_id)
   elseif OmniSharp#proc#supportsVimJobs()
-    call job_stop(job_id)
+    call job_stop(job.job_id)
   elseif OmniSharp#proc#supportsVimDispatch()
-    call dispatch#abort_command(0, job_id.command)
+    call dispatch#abort_command(0, job.command)
   elseif OmniSharp#proc#supportsVimProc()
-    call job_id.kill()
+    call job.kill()
   endif
-  if has_key(s:jobs, a:jobkey)
-    call remove(s:jobs, a:jobkey)
-  endif
+  let job.stopped = 1
+  silent doautocmd <nomodeline> User OmniSharpStopped
+endfunction
+
+function! OmniSharp#proc#ListJobs() abort
+  return keys(s:jobs)
 endfunction
 
 function! OmniSharp#proc#ListRunningJobs() abort
@@ -174,21 +251,30 @@ function! OmniSharp#proc#ListRunningJobs() abort
 endfunction
 
 function! OmniSharp#proc#IsJobRunning(jobkey) abort
-  if !has_key(s:jobs, a:jobkey)
-    return 0
+  " Either a jobkey (sln_or_dir) or a job may be passed in
+  if type(a:jobkey) == type({})
+    let job = a:jobkey
+  else
+    if !has_key(s:jobs, a:jobkey)
+      return 0
+    endif
+    let job = get(s:jobs, a:jobkey)
   endif
-  let job_id = get(s:jobs, a:jobkey)
   if OmniSharp#proc#supportsNeovimJobs()
-    return 1
+    return !(get(job, 'stopped', 0) || get(job, 'stopping', 0))
   elseif OmniSharp#proc#supportsVimJobs()
-    let status = job_status(job_id)
-    return status ==# 'run'
+    let status = job_status(job.job_id)
+    return status ==# 'run' && !(get(job, 'stopped', 0) || get(job, 'stopping', 0))
   elseif OmniSharp#proc#supportsVimDispatch()
-    return dispatch#completed(job_id)
+    return dispatch#completed(job)
   elseif OmniSharp#proc#supportsVimProc()
-    let [cond, status] = job_id.checkpid()
+    let [cond, status] = job.checkpid()
     return status != 0
   endif
+endfunction
+
+function! OmniSharp#proc#GetJob(jobkey) abort
+  return get(s:jobs, a:jobkey, '')
 endfunction
 
 " }}} public functions "
@@ -196,7 +282,7 @@ endfunction
 " private functions {{{ "
 
 function! s:debug(message) abort
-  if g:OmniSharp_proc_debug == 1
+  if get(g:, 'OmniSharp_proc_debug')
     echom 'DEBUG: ' . string(a:message)
   endif
 endfunction

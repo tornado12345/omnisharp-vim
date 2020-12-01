@@ -1,13 +1,15 @@
-if !get(g:, 'OmniSharp_loaded', 0)
-  finish
-endif
+if !get(g:, 'OmniSharp_loaded', 0) | finish | endif
+if !OmniSharp#util#CheckCapabilities() | finish | endif
+" When using async/stdio, a different method is used, see
+" autoload/ale/sources/OmniSharp.vim
+if g:OmniSharp_server_stdio | finish | endif
 
 let s:delimiter = '@@@'
 
 function! ale_linters#cs#omnisharp#ProcessOutput(buffer, lines) abort
   let list = []
   for line in a:lines
-    let [filename, lnum, col, type, subtype, text] = split(line, s:delimiter)
+    let [filename, lnum, col, type, subtype, text] = split(line, s:delimiter, 1)
     let item = {
           \ 'filename': filename,
           \ 'lnum': lnum,
@@ -24,7 +26,7 @@ function! ale_linters#cs#omnisharp#ProcessOutput(buffer, lines) abort
 endfunction
 
 function! ale_linters#cs#omnisharp#GetCommand(bufnum) abort
-  let linter = OmniSharp#util#path_join(['python', 'ale_lint.py'])
+  let linter = OmniSharp#util#PathJoin(['python', 'ale_lint.py'])
   let host = OmniSharp#GetHost(a:bufnum)
   let cmd = printf(
         \ '%%e %s --filename %%s --host %s --level %s --cwd %s --delimiter %s --encoding %s',

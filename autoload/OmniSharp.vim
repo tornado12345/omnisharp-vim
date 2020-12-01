@@ -1,87 +1,46 @@
-if !(has('python') || has('python3'))
-  finish
-endif
+if !OmniSharp#util#CheckCapabilities() | finish | endif
 
 let s:save_cpo = &cpoptions
 set cpoptions&vim
 
-" Load python helper functions
-call OmniSharp#py#bootstrap()
-
-" Setup variable defaults
-let s:allUserTypes = ''
-let s:allUserInterfaces = ''
-let s:allUserAttributes = ''
-let s:generated_snippets = {}
-let s:last_completion_dictionary = {}
-let s:alive_cache = []
-let g:OmniSharp_py_err = {}
-
-" Preserve backwards compatibility with older version of
-" g:OmniSharp_server_ports option
-if exists('g:OmniSharp_sln_ports')
-  let g:OmniSharp_server_ports = g:OmniSharp_sln_ports
+if !g:OmniSharp_server_stdio
+  " Load python helper functions
+  call OmniSharp#py#Bootstrap()
 endif
 
-let s:initial_server_ports = copy(g:OmniSharp_server_ports)
-
-function! OmniSharp#GetPort(...) abort
-  if exists('g:OmniSharp_port')
-    return g:OmniSharp_port
-  endif
-
-  let sln_or_dir = a:0 ? a:1 : OmniSharp#FindSolutionOrDir()
-  if empty(sln_or_dir)
-    return 0
-  endif
-
-  " If we're already running this solution, choose the port we're running on
-  if has_key(g:OmniSharp_server_ports, sln_or_dir)
-    return g:OmniSharp_server_ports[sln_or_dir]
-  endif
-
-  " Otherwise, find a free port and use that for this solution
-  let port = OmniSharp#py#eval('find_free_port()')
-  if OmniSharp#CheckPyError() | return 0 | endif
-  let g:OmniSharp_server_ports[sln_or_dir] = port
-  return port
-endfunction
-
-" Called from python
 function! OmniSharp#GetHost(...) abort
-  let bufnum = a:0 ? a:1 : bufnr('%')
-
-  if empty(getbufvar(bufnum, 'OmniSharp_host'))
-    let sln_or_dir = OmniSharp#FindSolutionOrDir(1, bufnum)
-    let port = OmniSharp#GetPort(sln_or_dir)
-    if port == 0
-      return ''
+  let bufnr = a:0 ? a:1 : bufnr('%')
+  if g:OmniSharp_server_stdio
+    " Using the stdio server, b:OmniSharp_host is a dict containing the
+    " `sln_or_dir` and an `initialized` flag indicating whether this buffer has
+    " successfully been registered with the server:
+    " { 'sln_or_dir': '/path/to/solution_or_dir', 'initialized': 1 }
+    let host = getbufvar(bufnr, 'OmniSharp_host', {})
+    if get(host, 'sln_or_dir', '') ==# ''
+      let host.sln_or_dir = OmniSharp#FindSolutionOrDir(1, bufnr)
+      let host.initialized = 0
+      call setbufvar(bufnr, 'OmniSharp_host', host)
     endif
-    let host = get(g:, 'OmniSharp_host', 'http://localhost:' . port)
-    call setbufvar(bufnum, 'OmniSharp_host', host)
+    " The returned dict includes the job, but the job is _not_ part of
+    " b:OmniSharp_host. It is important to always fetch the job from
+    " OmniSharp#proc#GetJob, ensuring that the job properties (job.job_id,
+    " job.loaded, job.pid etc.) are always correct and up-to-date.
+    return extend(copy(host), { 'job': OmniSharp#proc#GetJob(host.sln_or_dir) })
+  else
+    " Using the HTTP server, b:OmniSharp_host is a localhost URL
+    if empty(getbufvar(bufnr, 'OmniSharp_host'))
+      let sln_or_dir = OmniSharp#FindSolutionOrDir(1, bufnr)
+      let port = OmniSharp#py#GetPort(sln_or_dir)
+      if port == 0
+        return ''
+      endif
+      let host = get(g:, 'OmniSharp_host', 'http://localhost:' . port)
+      call setbufvar(bufnr, 'OmniSharp_host', host)
+    endif
+    return getbufvar(bufnr, 'OmniSharp_host')
   endif
-  return getbufvar(bufnum, 'OmniSharp_host')
 endfunction
 
-function! OmniSharp#GetCompletions(partial, ...) abort
-  if !OmniSharp#IsServerRunning()
-    let completions = []
-  else
-    let completions = OmniSharp#py#eval(printf('getCompletions(%s)', string(a:partial)))
-    if OmniSharp#CheckPyError() | return [] | endif
-  endif
-  let s:last_completion_dictionary = {}
-  for completion in completions
-    let s:last_completion_dictionary[get(completion, 'word')] = completion
-  endfor
-  if a:0 > 0
-    " If a callback has been passed in, then use it
-    call a:1(completions)
-  else
-    " Otherwise just return the results
-    return completions
-  endif
-endfunction
 
 function! OmniSharp#Complete(findstart, base) abort
   if a:findstart
@@ -91,521 +50,215 @@ function! OmniSharp#Complete(findstart, base) abort
     while start > 0 && line[start - 1] =~# '\v[a-zA-z0-9_]'
       let start -= 1
     endwhile
-
     return start
   else
-    return OmniSharp#GetCompletions(a:base)
+    return OmniSharp#actions#complete#Get(a:base)
   endif
 endfunction
 
-function! OmniSharp#FindUsages() abort
-  let qf_taglist = OmniSharp#py#eval('findUsages()')
-  if OmniSharp#CheckPyError() | return | endif
 
-  " Place the tags in the quickfix window, if possible
-  if len(qf_taglist) > 0
-    call s:set_quickfix(qf_taglist, 'Usages: '.expand('<cword>'))
-  else
-    echo 'No usages found'
-  endif
+function! OmniSharp#CodeCheck(...) abort
+  call s:WarnObsolete('OmniSharp#actions#diagnostics#Check()')
+  call OmniSharp#actions#diagnostics#Check(a:0 ? a:1 : 0)
 endfunction
 
-function! OmniSharp#FindImplementations() abort
-  let qf_taglist = OmniSharp#py#eval('findImplementations()')
-  if OmniSharp#CheckPyError() | return | endif
-
-  let numImpls = len(qf_taglist)
-  if numImpls == 0
-    echo 'No implementations found'
-  else
-    if numImpls == 1
-      let usage = qf_taglist[0]
-      call OmniSharp#JumpToLocation(usage.filename, usage.lnum, usage.col, 0)
-    else " numImpls > 1
-      call s:set_quickfix(qf_taglist, 'Implementations: '.expand('<cword>'))
-    endif
-  endif
-
-  return numImpls
+function! OmniSharp#CodeFormat(...) abort
+  call s:WarnObsolete('OmniSharp#actions#format#Format()')
+  call OmniSharp#actions#format#Format(a:0 ? a:1 : 0)
 endfunction
 
-function! OmniSharp#FindMembers() abort
-  let qf_taglist = OmniSharp#py#eval('findMembers()')
-  if OmniSharp#CheckPyError() | return | endif
-
-  " Place the tags in the quickfix window, if possible
-  " TODO: Should this use the location window instead, since it is
-  " buffer-specific?
-  if len(qf_taglist) > 1
-    call s:set_quickfix(qf_taglist, 'Members')
-  endif
+function! OmniSharp#CountCodeActions(...) abort
+  call s:WarnObsolete('OmniSharp#actions#codeactions#Count()')
+  call OmniSharp#actions#codeactions#Count(a:0 ? a:1 : 0)
 endfunction
 
-function! OmniSharp#NavigateUp() abort
-  call OmniSharp#py#eval('navigateUp()')
-  call OmniSharp#CheckPyError()
+function! OmniSharp#FindImplementations(...) abort
+  call s:WarnObsolete('OmniSharp#actions#implementations#Find()')
+  call OmniSharp#actions#implementations#Find(a:0 ? a:1 : 0)
 endfunction
 
-" Find the solution or directory for this file.
-function! OmniSharp#FindSolutionOrDir(...) abort
-  let interactive = a:0 ? a:1 : 1
-  let bufnum = a:0 > 1 ? a:2 : bufnr('%')
-  if empty(getbufvar(bufnum, 'OmniSharp_buf_server'))
-    let dir = s:FindServerRunningOnParentDirectory(bufnum)
-    if !empty(dir)
-      call setbufvar(bufnum, 'OmniSharp_buf_server', dir)
-    else
-      try
-        let sln = s:FindSolution(interactive, bufnum)
-        call setbufvar(bufnum, 'OmniSharp_buf_server', sln)
-      catch e
-        return ''
-      endtry
-    endif
-  endif
-
-  return getbufvar(bufnum, 'OmniSharp_buf_server')
-endfunction
-
-function! OmniSharp#NavigateDown() abort
-  call OmniSharp#py#eval('navigateDown()')
-  call OmniSharp#CheckPyError()
-endfunction
-
-function! OmniSharp#GotoDefinition() abort
-  let loc = OmniSharp#py#eval('gotoDefinition()')
-  if OmniSharp#CheckPyError() | return | endif
-  if type(loc) != type({}) " Check whether a dict was returned
-    echo 'Not found'
-  else
-    call OmniSharp#JumpToLocation(loc.filename, loc.lnum, loc.col, 0)
-  endif
-endfunction
-
-function! OmniSharp#PreviewDefinition() abort
-  let loc = OmniSharp#py#eval('gotoDefinition()')
-  if OmniSharp#CheckPyError() | return | endif
-  if type(loc) != type({}) " Check whether a dict was returned
-    echo 'Not found'
-  else
-    call s:openLocationInPreview(loc)
-    echo fnamemodify(loc.filename, ':.')
-  endif
-endfunction
-
-function! OmniSharp#PreviewImplementation() abort
-  let locations = OmniSharp#py#eval('findImplementations()')
-  if OmniSharp#CheckPyError() | return | endif
-  let numImplementations = len(locations)
-  if numImplementations == 0
-    echo 'No implementations found'
-  else
-    call s:openLocationInPreview(locations[0])
-    let fname = fnamemodify(locations[0].filename, ':.')
-    if numImplementations == 1
-      echo fname
-    else
-      echo fname . ': Implementation 1 of ' . numImplementations
-    endif
-  endif
-endfunction
-
-function! s:openLocationInPreview(loc) abort
-  let lazyredraw_bak = &lazyredraw
-  let &lazyredraw = 1
-  " Due to cursor jumping bug, opening preview at current file is not as
-  " simple as `pedit %`:
-  " http://vim.1045645.n5.nabble.com/BUG-BufReadPre-autocmd-changes-cursor-position-on-pedit-td1206965.html
-  let winview = winsaveview()
-
-  execute 'silent pedit' a:loc.filename
-  wincmd P
-  call cursor(a:loc.lnum, a:loc.col)
-  normal! zt
-  wincmd p
-
-  " Jump cursor back to symbol.
-  call winrestview(winview)
-  let &lazyredraw = lazyredraw_bak
-endfunction
-
-function! OmniSharp#JumpToLocation(filename, line, column, noautocmds) abort
-  if a:filename !=# ''
-    if fnamemodify(a:filename, ':p') ==# expand('%:p')
-      " Update the ' mark, adding this location to the jumplist. This is not
-      " necessary when the location is in another buffer - :edit performs the
-      " same functionality.
-      normal! m'
-    else
-      let command = 'edit ' . fnameescape(a:filename)
-      if a:noautocmds
-        let command = 'noautocmd ' . command
-      endif
-      try
-        execute command
-      catch /^Vim(edit):E37/
-        call OmniSharp#util#EchoErr('No write since last change')
-        return 0
-      endtry
-    endif
-    if a:line > 0 && a:column > 0
-      call cursor(a:line, a:column)
-    endif
-    return 1
-  endif
+function! OmniSharp#FindMembers(...) abort
+  call s:WarnObsolete('OmniSharp#actions#members#Find()')
+  call OmniSharp#actions#members#Find(a:0 ? a:1 : 0)
 endfunction
 
 function! OmniSharp#FindSymbol(...) abort
-  let filter = a:0 ? a:1 : ''
-  if !OmniSharp#IsServerRunning()
-    return
-  endif
-  let quickfixes = OmniSharp#py#eval(printf('findSymbols(%s)', string(filter)))
-  if OmniSharp#CheckPyError() | return | endif
-  if empty(quickfixes)
-    echo 'No symbols found'
-    return
-  endif
-  if g:OmniSharp_selector_ui ==? 'unite'
-    call unite#start([['OmniSharp/findsymbols', quickfixes]])
-  elseif g:OmniSharp_selector_ui ==? 'ctrlp'
-    call ctrlp#OmniSharp#findsymbols#setsymbols(quickfixes)
-    call ctrlp#init(ctrlp#OmniSharp#findsymbols#id())
-  elseif g:OmniSharp_selector_ui ==? 'fzf'
-    call fzf#OmniSharp#findsymbols(quickfixes)
-  else
-    let title = 'Symbols'.(len(filter) ? ': '.filter : '')
-    call s:set_quickfix(quickfixes, title)
-  endif
+  call s:WarnObsolete('OmniSharp#actions#symbols#Find()')
+  call OmniSharp#actions#symbols#Find(a:0 ? a:1 : 0)
 endfunction
 
-" This function returns a count of the currently available code actions. It also
-" uses the code actions to pre-populate the code actions for
-" OmniSharp#GetCodeActions, and clears them on CursorMoved.
-"
-" If a callback function is passed in, the callback will also be called on
-" CursorMoved, allowing this function to be used to set up a temporary "Code
-" actions available" flag, e.g. in the statusline or signs column, and the
-" callback function can be used to clear the flag.
-function! OmniSharp#CountCodeActions(...) abort
-  let actions = OmniSharp#py#eval('getCodeActions("normal")')
-  if OmniSharp#CheckPyError() | return 0 | endif
-  let s:actions = actions
+function! OmniSharp#FindUsages(...) abort
+  call s:WarnObsolete('OmniSharp#actions#usages#Find()')
+  call OmniSharp#actions#usages#Find(a:0 ? a:1 : 0)
+endfunction
 
-  " v:t_func was added in vim8 - this form is backwards-compatible
-  if a:0 && type(a:1) == type(function('tr'))
-    let s:cb = a:1
-  endif
-
-  function! s:CleanupCodeActions() abort
-    unlet s:actions
-    if exists('s:cb')
-      call s:cb()
-      unlet s:cb
-    endif
-    autocmd! OmniSharp#CountCodeActions
-  endfunction
-
-  augroup OmniSharp#CountCodeActions
-    autocmd!
-    autocmd CursorMoved <buffer> call s:CleanupCodeActions()
-    autocmd CursorMovedI <buffer> call s:CleanupCodeActions()
-    autocmd BufLeave <buffer> call s:CleanupCodeActions()
-  augroup END
-
-  return len(s:actions)
+function! OmniSharp#FixUsings(...) abort
+  call s:WarnObsolete('OmniSharp#actions#usings#Fix()')
+  call OmniSharp#actions#usings#Fix(a:0 ? a:1 : 0)
 endfunction
 
 function! OmniSharp#GetCodeActions(mode) range abort
-  if exists('s:actions')
-    let actions = s:actions
-  else
-    let command = printf('getCodeActions(%s)', string(a:mode))
-    let actions = OmniSharp#py#eval(command)
-    if OmniSharp#CheckPyError() | return | endif
-  endif
-  if empty(actions)
-    echo 'No code actions found'
-    return
-  endif
-  if g:OmniSharp_selector_ui ==? 'unite'
-    let context = {'empty': 0, 'auto_resize': 1}
-    call unite#start([['OmniSharp/findcodeactions', a:mode, actions]], context)
-  elseif g:OmniSharp_selector_ui ==? 'ctrlp'
-    call ctrlp#OmniSharp#findcodeactions#setactions(a:mode, actions)
-    call ctrlp#init(ctrlp#OmniSharp#findcodeactions#id())
-  elseif g:OmniSharp_selector_ui ==? 'fzf'
-    call fzf#OmniSharp#getcodeactions(a:mode, actions)
-  else
-    let message = []
-    let i = 0
-    for action in actions
-      let i += 1
-      call add(message, printf(' %2d. %s', i, action.Name))
-    endfor
-    call add(message, 'Enter an action number, or just hit Enter to cancel: ')
-    let selection = str2nr(input(join(message, "\n")))
-    if type(selection) == type(0) && selection > 0 && selection <= i
-      let action = actions[selection - 1]
-      let command = substitute(get(action, 'Identifier'), '''', '\\''', 'g')
-      let command = printf('runCodeAction(''%s'', ''%s'')', a:mode, command)
-
-      let action = OmniSharp#py#eval(command)
-      if OmniSharp#CheckPyError() | return | endif
-      if !action
-        echo 'No action taken'
-      endif
-    endif
-  endif
+  call s:WarnObsolete('OmniSharp#actions#codeactions#Get()')
+  call OmniSharp#actions#codeactions#Get(a:mode)
 endfunction
 
-function! OmniSharp#CodeCheck() abort
-  if pumvisible()
-    return get(b:, 'codecheck', [])
-  endif
-  if bufname('%') ==# ''
-    return []
-  endif
-  if OmniSharp#IsServerRunning()
-    let codecheck = OmniSharp#py#eval('codeCheck()')
-    if OmniSharp#CheckPyError() | return [] | endif
-    let b:codecheck = codecheck
-  endif
-  return get(b:, 'codecheck', [])
+function! OmniSharp#GlobalCodeCheck() abort
+  call s:WarnObsolete('OmniSharp#actions#diagnostics#CheckGlobal()')
+  call OmniSharp#actions#diagnostics#CheckGlobal()
 endfunction
 
-function! OmniSharp#TypeLookupWithoutDocumentation() abort
-  call OmniSharp#TypeLookup(0)
-endfunction
-
-function! OmniSharp#TypeLookupWithDocumentation() abort
-  call OmniSharp#TypeLookup(1)
-endfunction
-
-function! OmniSharp#TypeLookup(includeDocumentation) abort
-  if g:OmniSharp_typeLookupInPreview || a:includeDocumentation
-    let ret = OmniSharp#py#eval('typeLookup(True)')
-    if OmniSharp#CheckPyError() | return | endif
-    if len(ret.doc) > 0
-      call s:writeToPreview(ret.type . "\n\n" . ret.doc)
-    else
-      call s:writeToPreview(ret.type)
-    endif
-  else
-    let ret = OmniSharp#py#eval('typeLookup(False)')
-    if OmniSharp#CheckPyError() | return | endif
-    call OmniSharp#Echo(ret.type)
-  endif
-endfunction
-
-function! OmniSharp#SignatureHelp() abort
-  let result = OmniSharp#py#eval('signatureHelp()')
-  if OmniSharp#CheckPyError() | return | endif
-  if type(result) != type({})
-    echo 'No signature help found'
-    " Clear existing preview content
-    let output = ''
-  else
-    if result.ActiveSignature == -1
-      " No signature matches - display all options
-      let output = join(map(result.Signatures, 'v:val.Label'), "\n")
-    else
-      let signature = result.Signatures[result.ActiveSignature]
-      if len(signature.Parameters) == 0
-        let output = signature.Label
-      else
-        let parameter = signature.Parameters[result.ActiveParameter]
-        let output = join([parameter.Label, parameter.Documentation], "\n")
-      endif
-    endif
-  endif
-  call s:writeToPreview(output)
-endfunction
-
-function! OmniSharp#Echo(message) abort
-  echo a:message[0:&columns * &cmdheight - 2]
-endfunction
-
-function! OmniSharp#Rename() abort
-  let renameto = inputdialog('Rename to:', expand('<cword>'))
-  if renameto !=# ''
-    call OmniSharp#RenameTo(renameto)
-  endif
-endfunction
-
-function! OmniSharp#RenameTo(renameto) abort
-  let command = printf('renameTo(%s)', string(a:renameto))
-  let changes = OmniSharp#py#eval(command)
-  if OmniSharp#CheckPyError() | return | endif
-
-  let save_lazyredraw = &lazyredraw
-  let save_eventignore = &eventignore
-  let buf = bufnr('%')
-  let curpos = getpos('.')
-  let view = winsaveview()
-  try
-    set lazyredraw eventignore=all
-    for change in changes
-      execute 'silent hide edit' fnameescape(change.FileName)
-      let modified = &modified
-      let content = split(change.Buffer, '\r\?\n')
-      silent % delete _
-      silent 1put =content
-      silent 1 delete _
-      if !modified
-        silent update
-      endif
-    endfor
-  finally
-    if bufnr('%') != buf
-      exec 'buffer ' . buf
-    endif
-    call setpos('.', curpos)
-    call winrestview(view)
-    silent update
-    let &eventignore = save_eventignore
-    silent edit  " reload to apply syntax
-    let &lazyredraw = save_lazyredraw
-  endtry
+function! OmniSharp#GotoDefinition(...) abort
+  call s:WarnObsolete('OmniSharp#actions#definition#Find()')
+  call OmniSharp#actions#definition#Find(a:0 ? a:1 : 0)
 endfunction
 
 function! OmniSharp#HighlightBuffer() abort
-  if bufname('%') ==# '' || OmniSharp#FugitiveCheck() | return | endif
-  if !OmniSharp#IsServerRunning() | return | endif
-
-  let ret = OmniSharp#py#eval('findHighlightTypes()')
-  if OmniSharp#CheckPyError() | return | endif
-
-  if has_key(ret, 'error')
-    echohl WarningMsg | echom ret.error | echohl None
-    return
-  endif
-
-  function! s:ClearHighlight(groupname)
-    try
-      execute 'syntax clear' a:groupname
-    catch | endtry
-  endfunction
-
-  let b:OmniSharp_hl_matches = get(b:, 'OmniSharp_hl_matches', [])
-
-  function! s:Highlight(types, group) abort
-    silent call s:ClearHighlight(a:group)
-    if empty(a:types)
-      return
-    endif
-    let l:types = uniq(sort(a:types))
-
-    " Cannot use vim syntax options as keywords, so remove types with these
-    " names. See :h :syn-keyword /Note
-    let l:opts = split('cchar conceal concealends contained containedin ' .
-    \ 'contains display extend fold nextgroup oneline skipempty skipnl ' .
-    \ 'skipwhite transparent')
-
-    " Create a :syn-match for each type with an option name.
-    let l:illegal = filter(copy(l:types), {i,v -> index(l:opts, v, 0, 1) >= 0})
-    for l:ill in l:illegal
-      " call add(b:OmniSharp_hl_matches, matchadd(a:group, '\<' . l:ill . '\>'))
-      let matchid = matchadd(a:group, '\<' . l:ill . '\>')
-      call add(b:OmniSharp_hl_matches, matchid)
-    endfor
-
-    call filter(l:types, {i,v -> index(l:opts, v, 0, 1) < 0})
-
-    if len(l:types)
-      execute 'syntax keyword' a:group join(l:types)
-    endif
-  endfunction
-
-  " Clear any matches - highlights with :syn keyword {option} names which cannot
-  " be created with :syn keyword
-  for l:matchid in b:OmniSharp_hl_matches
-    try
-      call matchdelete(l:matchid)
-    catch | endtry
-  endfor
-  let b:OmniSharp_hl_matches = []
-
-  call s:Highlight(ret.identifiers, 'csUserIdentifier')
-  call s:Highlight(ret.interfaces, 'csUserInterface')
-  call s:Highlight(ret.methods, 'csUserMethod')
-  call s:Highlight(ret.types, 'csUserType')
-
-  silent call s:ClearHighlight('csNewType')
-  syntax region csNewType start="@\@1<!\<new\>"hs=s+4 end="[;\n{(<\[]"me=e-1
-  \ contains=csNew,csUserType,csUserIdentifier
+  call s:WarnObsolete('OmniSharp#actions#highlight#Buffer()')
+  call OmniSharp#actions#highlight#Buffer()
 endfunction
 
-function! OmniSharp#UpdateBuffer() abort
-  if !OmniSharp#IsServerRunning() | return | endif
-  if bufname('%') ==# '' || OmniSharp#FugitiveCheck() | return | endif
-  if OmniSharp#BufferHasChanged() == 1
-    call OmniSharp#py#eval('updateBuffer()')
-    call OmniSharp#CheckPyError()
-  endif
+function OmniSharp#HighlightEchoKind() abort
+  call s:WarnObsolete('OmniSharp#actions#highlight#Echo()')
+  call OmniSharp#actions#highlight#Echo()
 endfunction
 
-function! OmniSharp#BufferHasChanged() abort
-  if b:changedtick != get(b:, 'Omnisharp_UpdateChangeTick', -1)
-    let b:Omnisharp_UpdateChangeTick = b:changedtick
-    return 1
-  endif
-  return 0
+function! OmniSharp#NavigateDown() abort
+  call s:WarnObsolete('OmniSharp#actions#navigate#Down()')
+  call OmniSharp#actions#navigate#Down()
 endfunction
 
-function! OmniSharp#CodeFormat() abort
-  call OmniSharp#py#eval('codeFormat()')
-  call OmniSharp#CheckPyError()
+function! OmniSharp#NavigateUp() abort
+  call s:WarnObsolete('OmniSharp#actions#navigate#Up()')
+  call OmniSharp#actions#navigate#Up()
 endfunction
 
-function! OmniSharp#FixUsings() abort
-  let qf_taglist = OmniSharp#py#eval('fix_usings()')
-  if OmniSharp#CheckPyError() | return | endif
-
-  if len(qf_taglist) > 0
-    call s:set_quickfix(qf_taglist, 'Usings')
-  endif
+function! OmniSharp#OpenLog(...) abort
+  call s:WarnObsolete('OmniSharp#log#Open()')
+  call OmniSharp#log#Open(a:0 ? a:1 : 0)
 endfunction
+
+function! OmniSharp#PreviewDefinition(...) abort
+  call s:WarnObsolete('OmniSharp#actions#definition#Preview()')
+  call OmniSharp#actions#definition#Preview(a:0 ? a:1 : 0)
+endfunction
+
+function! OmniSharp#PreviewImplementation() abort
+  call s:WarnObsolete('OmniSharp#actions#implementations#Preview()')
+  call OmniSharp#actions#implementations#Preview()
+endfunction
+
+function! OmniSharp#Rename() abort
+  call s:WarnObsolete('OmniSharp#actions#rename#Prompt()')
+  call OmniSharp#actions#rename#Prompt()
+endfunction
+
+function! OmniSharp#RenameTo(renameto, ...) abort
+  call s:WarnObsolete('OmniSharp#actions#rename#To()')
+  call OmniSharp#actions#rename#To(a:renameto, a:0 ? a:1 : 0)
+endfunction
+
+function! OmniSharp#RunTest() abort
+  call s:WarnObsolete('OmniSharp#actions#test#Run()')
+  call OmniSharp#actions#test#Run()
+endfunction
+
+function! OmniSharp#RunTestsInFile(...) abort
+  call s:WarnObsolete('OmniSharp#actions#test#RunInFile()')
+  call OmniSharp#actions#test#RunInFile(a:0 ? a:000 : 0)
+endfunction
+
+function! OmniSharp#SignatureHelp() abort
+  call s:WarnObsolete('OmniSharp#actions#signature#SignatureHelp()')
+  call OmniSharp#actions#signature#SignatureHelp()
+endfunction
+
+function! OmniSharp#TypeLookupWithDocumentation(...) abort
+  call s:WarnObsolete('OmniSharp#actions#documentation#Documentation()')
+  call OmniSharp#actions#documentation#Documentation(a:0 ? a:1 : 0)
+endfunction
+
+function! OmniSharp#TypeLookupWithoutDocumentation(...) abort
+  call s:WarnObsolete('OmniSharp#actions#documentation#TypeLookup()')
+  call OmniSharp#actions#documentation#TypeLookup(a:0 ? a:1 : 0)
+endfunction
+
+function! OmniSharp#UpdateBuffer(...) abort
+  call s:WarnObsolete('OmniSharp#actions#buffer#Update()')
+  call OmniSharp#actions#buffer#Update(a:0 ? a:1 : 0)
+endfunction
+
+function! s:WarnObsolete(newName) abort
+  echohl WarningMsg
+  echomsg printf('This function is obsolete; use %s instead', a:newName)
+  echohl None
+endfunction
+
 
 function! OmniSharp#IsAnyServerRunning() abort
   return !empty(OmniSharp#proc#ListRunningJobs())
 endfunction
 
 function! OmniSharp#IsServerRunning(...) abort
-  let sln_or_dir = a:0 ? a:1 : OmniSharp#FindSolutionOrDir(0)
+  let opts = a:0 ? a:1 : {}
+  if has_key(opts, 'sln_or_dir')
+    let sln_or_dir = opts.sln_or_dir
+  else
+    let bufnr = get(opts, 'bufnum', bufnr('%'))
+    let sln_or_dir = OmniSharp#FindSolutionOrDir(1, bufnr)
+  endif
   if empty(sln_or_dir)
     return 0
   endif
 
-  " If the port is hardcoded, another vim instance may be running the server, so
-  " we don't look for a running job and go straight to the network check.
-  if !s:IsServerPortHardcoded(sln_or_dir) && !OmniSharp#proc#IsJobRunning(sln_or_dir)
-    return 0
+  let running = OmniSharp#proc#IsJobRunning(sln_or_dir)
+
+  if g:OmniSharp_server_stdio
+    if !running
+      return 0
+    endif
+  else
+    " If the HTTP port is hardcoded, another vim instance may be running the
+    " server, so we don't look for a running job and go straight to the network
+    " check. Note that this only applies to HTTP servers - Stdio servers must be
+    " started by _this_ vim session.
+    if !OmniSharp#py#IsServerPortHardcoded(sln_or_dir) && !running
+      return 0
+    endif
   endif
 
-  let idx = index(s:alive_cache, sln_or_dir)
-  if idx >= 0
-    return 1
+  if g:OmniSharp_server_stdio
+    return OmniSharp#proc#GetJob(sln_or_dir).loaded
+  else
+    return OmniSharp#py#CheckAlive(sln_or_dir)
   endif
+endfunction
 
-  let alive = OmniSharp#py#eval('checkAliveStatus()')
-  if OmniSharp#CheckPyError() | return 0 | endif
-  if alive
-    " Cache the alive status so subsequent calls are faster
-    call add(s:alive_cache, sln_or_dir)
+" Find the solution or directory for this file.
+function! OmniSharp#FindSolutionOrDir(...) abort
+  let interactive = a:0 ? a:1 : 1
+  let bufnr = a:0 > 1 ? a:2 : bufnr('%')
+  if empty(getbufvar(bufnr, 'OmniSharp_buf_server'))
+    try
+      let sln = s:FindSolution(interactive, bufnr)
+      call setbufvar(bufnr, 'OmniSharp_buf_server', sln)
+    catch
+      return ''
+    endtry
   endif
-  return alive
+  return getbufvar(bufnr, 'OmniSharp_buf_server')
 endfunction
 
 function! OmniSharp#StartServerIfNotRunning(...) abort
   if OmniSharp#FugitiveCheck() | return | endif
-
+  " Bail early in this check if the file is a metadata file
+  if type(get(b:, 'OmniSharp_metadata_filename')) == type('') | return | endif
   let sln_or_dir = a:0 ? a:1 : ''
   call OmniSharp#StartServer(sln_or_dir, 1)
 endfunction
 
 function! OmniSharp#FugitiveCheck() abort
-  return &buftype ==# 'nofile' || match(expand('%:p'), '\vfugitive:(///|\\\\)' ) == 0
+  return &buftype ==# 'nofile'
+  \ || match(expand('%:p'), '\vfugitive:(///|\\\\)' ) == 0
 endfunction
 
 function! OmniSharp#StartServer(...) abort
@@ -616,30 +269,45 @@ function! OmniSharp#StartServer(...) abort
     if filereadable(sln_or_dir)
       let file_ext = fnamemodify(sln_or_dir, ':e')
       if file_ext !=? 'sln'
-        call OmniSharp#util#EchoErr("Provided file '" . sln_or_dir . "' is not a solution.")
+        call OmniSharp#util#EchoErr(
+        \ printf("'%s' is not a solution file", sln_or_dir))
         return
       endif
     elseif !isdirectory(sln_or_dir)
-      call OmniSharp#util#EchoErr("Provided path '" . sln_or_dir . "' is not a sln file or a directory.")
+      call OmniSharp#util#EchoErr(
+      \ printf("'%s' is not a solution file or directory", sln_or_dir))
       return
     endif
   else
     let sln_or_dir = OmniSharp#FindSolutionOrDir()
     if empty(sln_or_dir)
-      call OmniSharp#util#EchoErr('Could not find solution file or directory to start server')
-      return
+      if expand('%:e') ==? 'csx' || expand('%:e') ==? 'cake'
+        " .csx and .cake files do not require solutions or projects
+        let sln_or_dir = expand('%:p:h')
+      else
+        call OmniSharp#util#EchoErr(
+        \ 'Could not find a solution or project to start server with')
+        return
+      endif
     endif
   endif
 
   " Optionally perform check if server is already running
   if check_is_running
-    let running = OmniSharp#proc#IsJobRunning(sln_or_dir)
-    " If the port is hardcoded, we should check if any other vim instances have
-    " started this server
-    if !running && s:IsServerPortHardcoded(sln_or_dir)
-      let running = OmniSharp#IsServerRunning(sln_or_dir)
+    let job = OmniSharp#proc#GetJob(sln_or_dir)
+    if type(job) == type({}) && get(job, 'stopped')
+      " The job has been manually stopped - do not start it again until
+      " instructed
+      return
     endif
-
+    let running = OmniSharp#proc#IsJobRunning(sln_or_dir)
+    if !g:OmniSharp_server_stdio
+      " If the port is hardcoded, we should check if any other vim instances
+      " have started this server
+      if !running && OmniSharp#py#IsServerPortHardcoded(sln_or_dir)
+        let running = OmniSharp#IsServerRunning({ 'sln_or_dir': sln_or_dir })
+      endif
+    endif
     if running | return | endif
   endif
 
@@ -648,18 +316,25 @@ endfunction
 
 function! s:StartServer(sln_or_dir) abort
   if OmniSharp#proc#IsJobRunning(a:sln_or_dir)
-    call OmniSharp#util#EchoErr('OmniSharp is already running on ' . a:sln_or_dir)
+    call OmniSharp#util#EchoErr(
+    \ printf("OmniSharp is already running '%s'", a:sln_or_dir))
     return
   endif
 
-  let l:command = OmniSharp#util#get_start_cmd(a:sln_or_dir)
+  let l:command = OmniSharp#util#GetStartCmd(a:sln_or_dir)
 
   if l:command ==# []
-    call OmniSharp#util#EchoErr('Could not determine the command to start the OmniSharp server!')
+    call OmniSharp#util#EchoErr(
+    \ 'Failed to build command to start the OmniSharp server')
     return
   endif
 
-  call OmniSharp#proc#RunAsyncCommand(command, a:sln_or_dir)
+  call OmniSharp#proc#Start(command, a:sln_or_dir)
+  if g:OmniSharp_server_stdio
+    let b:OmniSharp_host = {
+    \ 'sln_or_dir': a:sln_or_dir
+    \}
+  endif
 endfunction
 
 function! OmniSharp#StopAllServers() abort
@@ -669,18 +344,12 @@ function! OmniSharp#StopAllServers() abort
 endfunction
 
 function! OmniSharp#StopServer(...) abort
-  let sln_or_dir = OmniSharp#FindSolutionOrDir()
-  if a:0 > 0
-    let force = a:1
-    if a:0 > 1
-      let sln_or_dir = a:2
-    endif
-  else
-    let force = 0
-  endif
-
+  let force = a:0 ? a:1 : 0
+  let sln_or_dir = a:0 > 1 ? a:2 : OmniSharp#FindSolutionOrDir()
   if force || OmniSharp#proc#IsJobRunning(sln_or_dir)
-    call s:BustAliveCache(sln_or_dir)
+    if !g:OmniSharp_server_stdio
+      call OmniSharp#py#Uncache(sln_or_dir)
+    endif
     call OmniSharp#proc#StopJob(sln_or_dir)
   endif
 endfunction
@@ -707,78 +376,12 @@ function! OmniSharp#RestartAllServers() abort
   endfor
 endfunction
 
-function! OmniSharp#AppendCtrlPExtensions() abort
-  " Don't override settings made elsewhere
-  if !exists('g:ctrlp_extensions')
-    let g:ctrlp_extensions = []
-  endif
-  if !exists('g:OmniSharp_ctrlp_extensions_added')
-    let g:OmniSharp_ctrlp_extensions_added = 1
-    let g:ctrlp_extensions += ['findsymbols', 'findcodeactions']
-  endif
-endfunction
 
-function! OmniSharp#ExpandAutoCompleteSnippet()
-  if !g:OmniSharp_want_snippet
-    return
-  endif
-
-  if empty(globpath(&runtimepath, 'plugin/UltiSnips.vim'))
-    call OmniSharp#util#EchoErr('g:OmniSharp_want_snippet is enabled but this requires the UltiSnips plugin and it is not installed.')
-    return
-  endif
-
-  let line = strpart(getline('.'), 0, col('.')-1)
-  let remove_whitespace_regex = '^\s*\(.\{-}\)\s*$'
-
-  let completion = matchstr(line, '.*\zs\s\W.\+(.*)')
-  let completion = substitute(completion, remove_whitespace_regex, '\1', '')
-
-  let should_expand_completion = len(completion) != 0
-
-  if should_expand_completion
-    let completion = split(completion, '\.')[-1]
-    let completion = split(completion, 'new ')[-1]
-    let completion = split(completion, '= ')[-1]
-
-    if has_key(s:last_completion_dictionary, completion)
-      let snippet = get(get(s:last_completion_dictionary, completion, ''), 'snip','')
-      if !has_key(s:generated_snippets, completion)
-        call UltiSnips#AddSnippetWithPriority(completion, snippet, completion, 'iw', 'cs', 1)
-        let s:generated_snippets[completion] = snippet
-      endif
-      call UltiSnips#CursorMoved()
-      call UltiSnips#ExpandSnippetOrJump()
-    endif
-  endif
-endfunction
-
-function! OmniSharp#OpenPythonLog() abort
-  let logfile = OmniSharp#py#eval('getLogFile()')
-  if OmniSharp#CheckPyError() | return | endif
-  exec 'edit ' . logfile
-endfunction
-
-function! OmniSharp#CheckPyError(...)
-  let should_print = a:0 ? a:1 : 1
-  if !empty(g:OmniSharp_py_err)
-    if should_print
-      call OmniSharp#util#EchoErr(g:OmniSharp_py_err.code . ': ' . g:OmniSharp_py_err.msg)
-    endif
-    " If we got a connection error when hitting the server, then the server may
-    " not be running anymore and we should bust the 'alive' cache
-    if g:OmniSharp_py_err.code ==? 'CONNECTION'
-      call s:BustAliveCache()
-    endif
-    return 1
-  endif
-  return 0
-endfunction
-
-function! s:FindSolution(interactive, bufnum) abort
-  let solution_files = s:find_solution_files(a:bufnum)
+function! s:FindSolution(interactive, bufnr) abort
+  let solution_files = s:FindSolutionsFiles(a:bufnr)
   if empty(solution_files)
-    return ''
+    " This file has no parent solution, so check for running solutions
+    return s:FindRunningServerForBuffer(a:bufnr)
   endif
 
   if len(solution_files) == 1
@@ -787,15 +390,22 @@ function! s:FindSolution(interactive, bufnum) abort
   \      g:OmniSharp_sln_list_index < len(solution_files)
     return solution_files[g:OmniSharp_sln_list_index]
   else
+    " Use an existing solution if one exists
+    let running = s:FindRunningServerForBuffer(a:bufnr)
+    if !empty(running)
+      return running
+    endif
+
     if g:OmniSharp_autoselect_existing_sln
-      let running_slns = []
-      for solutionfile in solution_files
-        if has_key(g:OmniSharp_server_ports, solutionfile)
-          call add(running_slns, solutionfile)
+      if !g:OmniSharp_server_stdio
+        let running_slns = OmniSharp#py#FindRunningServer(solution_files)
+        if len(running_slns) == 1
+          return running_slns[0]
         endif
-      endfor
-      if len(running_slns) == 1
-        return running_slns[0]
+      endif
+      if exists('s:selected_sln')
+        " Return the previously selected solution
+        return s:selected_sln
       endif
     endif
 
@@ -815,93 +425,210 @@ function! s:FindSolution(interactive, bufnum) abort
     if choice <= 0 || choice > len(solution_files)
       throw 'No solution selected'
     endif
-    return solution_files[choice - 1]
+    let s:selected_sln = solution_files[choice - 1]
+    return s:selected_sln
   endif
 endfunction
 
-function! s:FindServerRunningOnParentDirectory(bufnum) abort
-  let filename = expand('#' . a:bufnum . ':p')
+" Check whether filename is in the same directory or subdirectory of a running
+" server solution, or one of the solution's included projects
+function! s:FindRunningServerForBuffer(bufnr) abort
+  let filename = expand('#' . a:bufnr . ':p')
+  let selected_sln_or_dir = ''
   let longest_dir_match = ''
   let longest_dir_length = 0
   let running_jobs = OmniSharp#proc#ListRunningJobs()
+  let dir_separator = fnamemodify('.', ':p')[-1 :]
   for sln_or_dir in running_jobs
-    if isdirectory(sln_or_dir) && s:DirectoryContainsFile(sln_or_dir, filename)
-      let dir_length = len(sln_or_dir)
-      if dir_length > longest_dir_length
-        let longest_dir_match = sln_or_dir
-        let longest_dir_length = dir_length
+    let paths = [sln_or_dir]
+    for project in get(OmniSharp#proc#GetJob(sln_or_dir), 'projects', [])
+      call add(paths, OmniSharp#util#TranslatePathForClient(project.path))
+    endfor
+    for path in paths
+      let directory = isdirectory(path) ? path : fnamemodify(path, ':h')
+      if directory[len(directory) -1] != dir_separator
+        let directory .= dir_separator
       endif
-    endif
+      if stridx(filename, directory) == 0
+        if len(path) > longest_dir_length
+          let longest_dir_match = path
+          let selected_sln_or_dir = sln_or_dir
+          let longest_dir_length = len(path)
+        endif
+      endif
+    endfor
   endfor
-
-  return longest_dir_match
+  return selected_sln_or_dir
 endfunction
 
-function! s:DirectoryContainsFile(directory, file) abort
-  let idx = stridx(a:file, a:directory)
-  return (idx == 0)
+
+function! OmniSharp#Status(include_dead) abort
+  let jobs = map(OmniSharp#proc#ListJobs(), {_,s -> OmniSharp#proc#GetJob(s)})
+  call filter(jobs, {_,j -> type(j) == type({})})
+  if len(jobs) == 0
+    echohl WarningMsg | echo 'No servers started' | echohl None
+    return
+  endif
+
+  function! s:SortServers(j1, j2) abort
+    let t1 = has_key(a:j1, 'start_time') ? reltimefloat(a:j1.start_time) : 0
+    let t2 = has_key(a:j2, 'start_time') ? reltimefloat(a:j2.start_time) : 0
+    return t1 == t2 ? 0 : t1 < t2 ? 1 : -1
+  endfunction
+  call sort(jobs, 's:SortServers')
+
+  for job in jobs
+    if OmniSharp#proc#IsJobRunning(job.sln_or_dir)
+      let total = get(job, 'projects_total', 0)
+      let loaded = get(job, 'projects_loaded', 0)
+      let pl = total == 1 ? '' : 's'
+      let pid = get(job, 'pid', '')
+      if g:OmniSharp_server_stdio
+        if get(job, 'loaded') || !g:OmniSharp_server_stdio
+          echohl Title
+            let status = printf('running (%d project%s)', total, pl)
+        else
+          echohl ModeMsg
+          let status = printf('loading (%d of %d project%s)', loaded, total, pl)
+        endif
+      else
+        if OmniSharp#py#CheckAlive(job.sln_or_dir)
+          echohl Title
+          let status = 'running'
+        else
+          echohl ModeMsg
+          let status = 'not running'
+        endif
+      endif
+      if has_key(job, 'start_time')
+        let seconds = float2nr(reltimefloat(reltime(job.start_time)))
+        if seconds < 60
+          let status .= printf(' for %d seconds', seconds)
+        else
+          let minutes = seconds / 60
+          if minutes == 1
+            let status .= ' for 1 minute'
+          elseif minutes < 60
+            let status .= printf(' for %d minutes', minutes)
+          else
+            let hours = minutes / 60
+            let minutes %= 60
+            if hours == 1
+              let status .= printf(' for an hour and %d minutes', minutes)
+            elseif hours < 48
+              let status .= printf(' for %d hours', hours)
+            else
+              let status .= printf(' for %d days', hours / 24)
+            endif
+          endif
+        endif
+      endif
+    elseif a:include_dead
+      echohl Comment
+      let status = 'not running'
+      let pid = ''
+    else
+      continue
+    endif
+    echo job.sln_or_dir
+    echohl None
+    if !empty(pid)
+      echon "\n  pid: "
+      echohl Identifier
+      echon pid . "\n"
+      echohl None
+    endif
+    echo '  ' . status
+  endfor
 endfunction
 
-let s:extension = has('win32') ? '.ps1' : '.sh'
-let s:script_location = expand('<sfile>:p:h:h').'/installer/omnisharp-manager'.s:extension
+
+let s:plugin_root_dir = expand('<sfile>:p:h:h')
+
 function! OmniSharp#Install(...) abort
-  echo 'Installing OmniSharp Roslyn...'
+  if exists('g:OmniSharp_server_path')
+    echohl WarningMsg
+    echomsg 'Installation not attempted, g:OmniSharp_server_path defined.'
+    echohl None
+    return
+  endif
+
+  echo 'Installing OmniSharp Roslyn, please wait...'
+
   call OmniSharp#StopAllServers()
 
-  let l:version = a:000 != [] ? ' -v '.a:000[0] : ''
+  let l:http = g:OmniSharp_server_stdio ? '' : '-H'
+  let l:version = a:0 > 0 ? '-v ' . shellescape(a:1) : ''
+  let l:location = shellescape(OmniSharp#util#ServerDir())
 
   if has('win32')
-    if s:check_valid_powershell_settings()
-      let l:location = expand('$HOME').'\.omnisharp\omnisharp-roslyn'
-      call system('powershell "& ""'.s:script_location.'""" -H -l "'.l:location
-            \ .'"'.l:version)
+    let l:logfile = s:plugin_root_dir . '\log\install.log'
+    let l:script = shellescape(
+    \ s:plugin_root_dir . '\installer\omnisharp-manager.ps1')
+    let l:version_file_location = l:location . '\OmniSharpInstall-version.txt'
 
-      if v:shell_error
-        echohl ErrorMsg
-        echomsg 'Installation to "' . l:location . '" failed inside PowerShell.'
-        echohl None
-      else
-        echomsg 'OmniSharp installed to: ' . l:location
-      endif
-    else
-      echohl ErrorMsg
-      echomsg 'Powershell is running at an ExecutionPolicy level that blocks OmniSharp-vim from installing the Roslyn server'
-      echohl None
-    endif
+    let l:command = printf(
+    \ 'powershell -ExecutionPolicy Bypass -File %s %s -l %s %s',
+    \ l:script, l:http, l:location, l:version)
   else
-    let l:mono = g:OmniSharp_server_use_mono ? ' -M' : ''
-    let l:result =  systemlist('sh "'.s:script_location.'" -Hl "$HOME/.omnisharp/omnisharp-roslyn/"'
-          \ .l:mono.l:version)
+    let l:logfile = s:plugin_root_dir . '/log/install.log'
+    let l:script = shellescape(
+    \ s:plugin_root_dir . '/installer/omnisharp-manager.sh')
+    let l:mono = g:OmniSharp_server_use_mono ? '-M' : ''
+    let l:version_file_location = l:location . '/OmniSharpInstall-version.txt'
 
-    if v:shell_error
-      echohl ErrorMsg
-      echomsg 'Failed to install the OmniSharp-Roslyn server'
-      echomsg l:result[-1]
-      echohl None
-    else
-      echomsg 'OmniSharp installed to: ~/.omnisharp/omnisharp-roslyn/'
+    let l:command = printf('/bin/sh %s %s %s -l %s %s',
+    \ l:script, l:http, l:mono, l:location, l:version)
+
+    if g:OmniSharp_translate_cygwin_wsl
+      let l:command .= ' -W'
     endif
+  endif
+
+  " Begin server installation
+  let l:error_msgs = systemlist(l:command)
+
+  if v:shell_error
+    " Log executed command and full error log
+    call writefile(['> ' . l:command, repeat('=', 80)], l:logfile)
+    call writefile(l:error_msgs, l:logfile, 'a')
+
+    echohl ErrorMsg
+    echomsg 'Failed to install the OmniSharp-Roslyn server'
+
+    " Display extra error information for Unix users
+    if !has('win32')
+      echomsg l:error_msgs[-1]
+    endif
+
+    echohl WarningMsg
+    echomsg 'The full error log can be found in the file: ' l:logfile
+    echohl None
+  else
+    let l:version = ''
+    try
+      let l:command = has('win32') ? 'type ' : 'cat '
+      let l:version = system(l:command . l:version_file_location)
+      let l:version = OmniSharp#util#Trim(l:version) . ' '
+    catch | endtry
+    echohl Title
+    echomsg printf('OmniSharp-Roslyn %sinstalled to %s', l:version, l:location)
+    echohl None
   endif
 endfunction
 
-function! s:check_valid_powershell_settings()
-  let l:ps_policy_level = system('powershell Get-ExecutionPolicy')
-  return l:ps_policy_level !~# '^\(Restricted\|AllSigned\)'
-endfunction
 
-function! s:find_solution_files(bufnum) abort
+function! s:FindSolutionsFiles(bufnr) abort
   "get the path for the current buffer
-  let dir = expand('#' . a:bufnum . ':p:h')
+  let dir = expand('#' . a:bufnr . ':p:h')
   let lastfolder = ''
   let solution_files = []
 
   while dir !=# lastfolder
-    if empty(solution_files)
-      let solution_files += s:globpath(dir, '*.sln')
-      let solution_files += s:globpath(dir, 'project.json')
+    let solution_files += s:globpath(dir, '*.sln')
+    let solution_files += s:globpath(dir, 'project.json')
 
-      call filter(solution_files, 'filereadable(v:val)')
-    endif
+    call filter(solution_files, 'filereadable(v:val)')
 
     if g:OmniSharp_prefer_global_sln
       let global_solution_files = s:globpath(dir, 'global.json')
@@ -912,55 +639,38 @@ function! s:find_solution_files(bufnum) abort
       endif
     endif
 
+    if !empty(solution_files)
+      return solution_files
+    endif
+
     let lastfolder = dir
     let dir = fnamemodify(dir, ':h')
   endwhile
+
+  if empty(solution_files)
+    let dir = expand('#' . a:bufnr . ':p:h')
+    let lastfolder = ''
+    let solution_files = []
+
+    while dir !=# lastfolder
+      let solution_files += s:globpath(dir, '*.csproj')
+
+      call uniq(map(solution_files, 'fnamemodify(v:val, ":h")'))
+
+      if !empty(solution_files)
+        return solution_files
+      endif
+
+      let lastfolder = dir
+      let dir = fnamemodify(dir, ':h')
+    endwhile
+  endif
 
   if empty(solution_files) && g:OmniSharp_start_without_solution
     let solution_files = [getcwd()]
   endif
 
   return solution_files
-endfunction
-
-function! s:IsServerPortHardcoded(sln_or_dir) abort
-  if exists('g:OmniSharp_port')
-    return 1
-  endif
-  return has_key(s:initial_server_ports, a:sln_or_dir)
-endfunction
-
-" Remove a server from the alive_cache
-function! s:BustAliveCache(...) abort
-  let sln_or_dir = a:0 ? a:1 : OmniSharp#FindSolutionOrDir(0)
-  let idx = index(s:alive_cache, sln_or_dir)
-  if idx != -1
-    call remove(s:alive_cache, idx)
-  endif
-endfunction
-
-function! s:set_quickfix(list, title)
-  if !has('patch-8.0.0657')
-  \ || setqflist([], ' ', {'nr': '$', 'items': a:list, 'title': a:title}) == -1
-    call setqflist(a:list)
-  endif
-  if g:OmniSharp_open_quickfix
-    botright cwindow
-  endif
-endfunction
-
-" Manually write content to the preview window.
-" Opens a preview window to a scratch buffer named '__OmniSharpScratch__'
-function! s:writeToPreview(content)
-  silent pedit __OmniSharpScratch__
-  silent wincmd P
-  setlocal modifiable noreadonly
-  setlocal nobuflisted buftype=nofile bufhidden=wipe
-  0,$d
-  silent put =a:content
-  0d_
-  setlocal nomodifiable readonly
-  silent wincmd p
 endfunction
 
 if has('patch-7.4.279')

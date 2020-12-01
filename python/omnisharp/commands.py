@@ -8,7 +8,7 @@ import vim  # pylint: disable=import-error
 from .util import VimUtilCtx
 from .util import find_free_port as util_find_free_port
 from .util import (formatPathForClient, formatPathForServer, getResponse,
-                   quickfixes_from_response)
+                   quickfixes_from_response, doRequest)
 from .vimcmd import vimcmd
 
 logger = logging.getLogger('omnisharp')
@@ -18,9 +18,9 @@ ctx = VimUtilCtx(vim)
 
 
 def openFile(filename, line=0, column=0, noautocmd=0):
-    cmd = "call OmniSharp#JumpToLocation('{0}', {1}, {2}, {3})" \
-          .format(filename, line, column, noautocmd)
-    vim.command(cmd)
+    vim.command("let l:loc = {{ 'filename': '{0}', 'lnum': {1}, 'col': {2} }}"
+                .format(filename, line, column))
+    vim.command("call OmniSharp#locations#Navigate(l:loc, {0})".format(noautocmd))
 
 
 def setBuffer(text):
@@ -30,39 +30,35 @@ def setBuffer(text):
     lines = text.splitlines()
     lines = [line.encode('utf-8') for line in lines]
     vim.current.buffer[:] = lines
-    vim.current.window.cursor = pos
+    try:
+        vim.current.window.cursor = pos
+    except vim.error:
+        vim.current.window.cursor = (len(vim.current.buffer), pos[1])
     return True
 
 
 @vimcmd
 def findUsages():
-    parameters = {}
-    parameters['MaxWidth'] = int(vim.eval('g:OmniSharp_quickFixLength'))
-    response = getResponse(ctx, '/findusages', parameters, json=True)
+    response = getResponse(ctx, '/findusages', json=True)
     return quickfixes_from_response(ctx, response['QuickFixes'])
 
 
 @vimcmd
 def findMembers():
-    parameters = {}
-    parameters['MaxWidth'] = int(vim.eval('g:OmniSharp_quickFixLength'))
-    response = getResponse(ctx, '/currentfilemembersasflat', parameters,
-                           json=True)
+    response = getResponse(ctx, '/currentfilemembersasflat', json=True)
     return quickfixes_from_response(ctx, response)
 
 
 @vimcmd
 def findImplementations():
-    parameters = {}
-    parameters['MaxWidth'] = int(vim.eval('g:OmniSharp_quickFixLength'))
-    response = getResponse(ctx, '/findimplementations', parameters, json=True)
+    response = getResponse(ctx, '/findimplementations', json=True)
     return quickfixes_from_response(ctx, response['QuickFixes'])
 
 
 @vimcmd
 def getCompletions(partialWord):
     parameters = {}
-    parameters['wordToComplete'] = partialWord
+    parameters['WordToComplete'] = partialWord
 
     parameters['WantDocumentationForEveryCompletionResult'] = \
         bool(int(vim.eval('g:omnicomplete_fetch_full_documentation')))
@@ -70,24 +66,37 @@ def getCompletions(partialWord):
     want_snippet = \
         bool(int(vim.eval('g:OmniSharp_want_snippet')))
 
+    without_overloads = \
+        bool(int(vim.eval('g:OmniSharp_completion_without_overloads')))
+
     parameters['WantSnippet'] = want_snippet
-    parameters['WantMethodHeader'] = want_snippet
-    parameters['WantReturnType'] = want_snippet
+    parameters['WantMethodHeader'] = True
+    parameters['WantReturnType'] = True
 
     response = getResponse(ctx, '/autocomplete', parameters, json=True)
 
     vim_completions = []
     if response is not None:
-        for completion in response:
+        for cmp in response:
+            if want_snippet:
+                word = cmp['MethodHeader'] or cmp['CompletionText']
+                menu = cmp['ReturnType'] or cmp['DisplayText']
+            elif without_overloads:
+                word = cmp['CompletionText']
+                menu = ''
+            else:
+                word = cmp['CompletionText'] or cmp['MethodHeader']
+                menu = cmp['DisplayText'] or cmp['MethodHeader']
+                menu = ' '.join(filter(None, [cmp['ReturnType'], menu]))
+
             vim_completions.append({
-                'snip': completion['Snippet'] or '',
-                'word': (completion['MethodHeader']
-                         or completion['CompletionText']),
-                'menu': completion['ReturnType'] or completion['DisplayText'],
-                'info': ((completion['Description'] or ' ')
+                'snip': cmp['Snippet'] or '',
+                'word': word,
+                'menu': menu,
+                'info': ((cmp['Description'] or ' ')
                          .replace('\r\n', '\n')),
                 'icase': 1,
-                'dup': 1
+                'dup': without_overloads ? 0 : 1
             })
     return vim_completions
 
@@ -97,11 +106,8 @@ def gotoDefinition():
     definition = getResponse(ctx, '/gotodefinition', json=True)
     if definition.get('FileName'):
         return quickfixes_from_response(ctx, [definition])[0]
-        # filename = formatPathForClient(ctx, definition['FileName'].replace("'", "''"))
-        # openFile(filename, definition['Line'], definition['Column'])
     else:
         return None
-        # print("Not found")
 
 
 @vimcmd
@@ -119,15 +125,19 @@ def runCodeAction(mode, action):
     changes = response.get('Changes')
     if changes:
         bufname = vim.current.buffer.name
+        bufnum = vim.current.buffer.number
         pos = vim.current.window.cursor
+        vim.command('let l:hidden_bak = &hidden | set hidden')
         for changeDefinition in changes:
-            filename = formatPathForClient(ctx,
-                                           changeDefinition['FileName'])
+            filename = formatPathForClient(ctx, changeDefinition['FileName'])
             openFile(filename, noautocmd=1)
             if not setBuffer(changeDefinition.get('Buffer')):
                 for change in changeDefinition.get('Changes', []):
                     setBuffer(change.get('NewText'))
+            if vim.current.buffer.number != bufnum:
+                vim.command('silent write | silent edit')
         openFile(bufname, pos[0], pos[1], 1)
+        vim.command('let &hidden = l:hidden_bak | unlet l:hidden_bak')
         return True
     return False
 
@@ -137,6 +147,13 @@ def codeActionParameters(mode):
     if mode == 'visual':
         start = vim.eval('getpos("\'<")')
         end = vim.eval('getpos("\'>")')
+        # In visual line mode, getpos("'>")[2] is a large number (2147483647).
+        # In python this is represented as a string, so when the length of this
+        # string is greater than 5 it means the position is greater than 99999.
+        # In this case, use the length of the line as the column position.
+        if len(end[2]) > 5:
+            end[2] = vim.eval('len(getline(%s))' % end[1])
+        logger.error(end)
         parameters['Selection'] = {
             'Start': {'Line': start[1], 'Column': start[2]},
             'End': {'Line': end[1], 'Column': end[2]}
@@ -149,6 +166,11 @@ def codeCheck():
     response = getResponse(ctx, '/codecheck', json=True)
     return quickfixes_from_response(ctx, response['QuickFixes'])
 
+@vimcmd
+def globalCodeCheck():
+    parameters = {}
+    response = doRequest(ctx.host, '/codecheck', parameters, json=True)
+    return quickfixes_from_response(ctx, response['QuickFixes'])
 
 @vimcmd
 def signatureHelp():
@@ -162,8 +184,8 @@ def typeLookup(include_documentation):
     }
     response = getResponse(ctx, '/typelookup', parameters, json=True)
     return {
-        'type': response.get('Type', '') or '',
-        'doc': response.get('Documentation', '') or '',
+        'Type': response.get('Type', '') or '',
+        'Documentation': response.get('Documentation', '') or ''
     }
 
 
@@ -178,7 +200,7 @@ def renameTo(name):
     for change in changes:
         ret.append({
             'FileName': formatPathForClient(ctx, change['FileName']),
-            'Buffer': change['Buffer'],
+            'Buffer': change['Buffer']
         })
     return ret
 
@@ -192,16 +214,17 @@ def codeFormat():
 
 
 @vimcmd
-def fix_usings():
+def fixUsings():
     response = getResponse(ctx, '/fixusings', json=True)
     setBuffer(response.get("Buffer"))
     return quickfixes_from_response(ctx, response['AmbiguousResults'])
 
 
 @vimcmd
-def findSymbols(filter=''):
+def findSymbols(filter='', symbolfilter=''):
     parameters = {}
     parameters["filter"] = filter
+    parameters["symbolfilter"] = symbolfilter
     response = getResponse(ctx, '/findsymbols', parameters, json=True)
     return quickfixes_from_response(ctx, response['QuickFixes'])
 

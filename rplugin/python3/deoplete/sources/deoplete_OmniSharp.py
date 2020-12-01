@@ -1,22 +1,16 @@
-""" OmniSharp source for deoplete """
+
+""" omnisharp source for deoplete """
 import logging
 import os
 import sys
 from os.path import abspath, dirname, exists, join, pardir
+import re
 
 from .base import Base
 
-OMNISHARP_ROOT = abspath(join(dirname(__file__), pardir, pardir, pardir,
-                              pardir))
-sys.path.append(join(OMNISHARP_ROOT, 'python'))
-
-
-try:
-    from omnisharp.util import getResponse, VimUtilCtx
-except ImportError:
-    pass
-
-
+# This implementation was based off of the deoplete-lsp deoplete source
+# Which is similar in that it calls lua to trigger a request, which receives a callback,
+# then re-triggers deoplete autocomplete
 class Source(Base):
     def __init__(self, vim):
         super().__init__(vim)
@@ -24,51 +18,33 @@ class Source(Base):
         self.name = 'omnisharp'
         self.mark = '[OS]'
         self.rank = 500
-        self.is_volatile = True
         self.filetypes = ['cs']
-        self._ctx = None
-        self._setup_logging()
-        self._log = logging.getLogger('omnisharp.deoplete')
+        # This pattern will trigger auto completion even if the typed text has not reached min_pattern_length
+        self.input_pattern = r'[^. \t0-9]\.\w*'
+        self.is_volatile = True
+        self.previousLhs = ''
+        self.partial = ''
 
-    def _setup_logging(self):
-        logger = logging.getLogger('omnisharp')
-        level = self.vim.eval('g:OmniSharp_loglevel').upper()
-        logger.setLevel(getattr(logging, level))
+    def parseInput(self, value):
+        match = re.match(r"^(.*\W)(\w*)$", value)
 
-        log_dir = join(OMNISHARP_ROOT, 'log')
-        if not exists(log_dir):
-            os.makedirs(log_dir)
-        log_file = join(log_dir, 'deoplete.log')
-        hdlr = logging.FileHandler(log_file)
-        logger.addHandler(hdlr)
-        formatter = logging.Formatter('%(asctime)s %(levelname)s %(message)s')
-        hdlr.setFormatter(formatter)
-        return logger
+        if match:
+            groups = match.groups()
+            return groups[0], groups[1]
+        return None, None
 
     def gather_candidates(self, context):
-        try:
-            return self._do_gather(context)
-        except Exception:
-            self._log.exception("Error autocompleting %(complete_str)r" % context)
+        currentInput = context['input']
 
-    def _do_gather(self, context):
-        self._ctx = VimUtilCtx(self.vim)
-        parameters = {}
-        parameters['wordToComplete'] = context['complete_str']
-        parameters['WantDocumentationForEveryCompletionResult'] = True
+        lhs, partial = self.parseInput(currentInput)
 
-        response = getResponse(self._ctx, '/autocomplete', parameters,
-                               json=True)
+        if lhs is None:
+            return []
 
-        vim_completions = []
-        if response is not None:
-            for completion in response:
-                vim_completions.append({
-                    'word': completion['CompletionText'],
-                    'menu': completion['DisplayText'],
-                    'info': ((completion['Description'] or ' ')
-                             .replace('\r\n', '\n')),
-                    'dup': 1,
-                })
+        if lhs != self.previousLhs or not partial.startswith(self.previousPartial):
+            self.previousLhs = lhs
+            self.previousPartial = partial
+            self.vim.call('deoplete#source#omnisharp#sendRequest', lhs, partial)
+            return []
 
-        return vim_completions
+        return self.vim.vars['deoplete#source#omnisharp#_results'] or []

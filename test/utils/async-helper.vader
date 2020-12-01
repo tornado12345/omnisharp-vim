@@ -1,0 +1,38 @@
+After():
+  call OmniSharpTestCleanupBuffer()
+
+Execute (set up async helper):
+  function! s:Callback(...)
+    let g:OmniSharp_test_waiting = 0
+  endfunction
+
+  function! OmniSharpWarmup(funcname, args) abort
+    call OmniSharpTestAwait(a:funcname, a:args, 1)
+  endfunction
+
+  function! OmniSharpTestAwait(funcname, args, warmup = 0) abort
+    let g:OmniSharp_test_waiting = 1
+    call function(a:funcname, a:args + [function('s:Callback')])()
+    let starttime = reltime()
+    while g:OmniSharp_test_waiting
+    \ && reltime(starttime)[0] < g:OmniSharp_test_timeout
+      sleep 50m
+    endwhile
+    if !a:warmup
+      Assert !g:OmniSharp_test_waiting, a:funcname . ' timed out'
+    endif
+  endfunction
+
+  function! OmniSharpTestInitializeBuffer(filename) abort
+    " Need to set a filename for OmniSharp-roslyn
+    execute printf('file example/%s.cs', a:filename)
+    set buftype=
+    if has_key(b:, 'OmniSharp_UpdateChangeTick')
+      unlet b:OmniSharp_UpdateChangeTick
+    endif
+    call OmniSharpTestAwait('OmniSharp#actions#buffer#Update', [])
+  endfunction
+
+  function! OmniSharpTestCleanupBuffer() abort
+    set buftype=nofile
+  endfunction
